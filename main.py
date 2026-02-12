@@ -23,7 +23,7 @@ import argparse
 import asyncio
 import sys
 
-from scraper import login, scrape_user, scrape_question, scrape_single_answer
+from scraper import login, scrape_user, scrape_question, scrape_single_answer, scrape_user_pins
 from pathlib import Path
 
 
@@ -85,6 +85,9 @@ def main():
 
   # 爬取单个回答及其评论区
   python main.py answer https://www.zhihu.com/question/12345/answer/67890 --with-comments
+
+  # 爬取某用户的所有想法
+  python main.py pins zhang-jia-wei
         """,
     )
 
@@ -147,6 +150,15 @@ def main():
     )
     _add_common_args(answer_parser)
 
+    # ── pins 子命令（用户想法） ──
+    pins_parser = subparsers.add_parser("pins", help="爬取指定用户的所有想法")
+    pins_parser.add_argument(
+        "user_url_token",
+        type=str,
+        help="知乎用户的 URL token（个人主页 URL 中的标识符）",
+    )
+    _add_common_args(pins_parser)
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -204,6 +216,20 @@ def main():
                 output_dir=output_dir,
                 download_img=not args.no_images,
                 with_comments=args.with_comments,
+                delay_min=args.delay_min,
+                delay_max=args.delay_max,
+                headless=args.headless,
+            )
+        )
+
+    elif args.command == "pins":
+        output_dir = Path(args.output) if args.output else None
+
+        asyncio.run(
+            scrape_user_pins(
+                user_url_token=args.user_url_token,
+                output_dir=output_dir,
+                download_img=not args.no_images,
                 delay_min=args.delay_min,
                 delay_max=args.delay_max,
                 headless=args.headless,

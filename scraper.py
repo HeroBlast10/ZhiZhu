@@ -4,11 +4,12 @@ scraper.py — 知乎内容爬虫核心模块
 功能：
 1. 使用 Playwright 持久化上下文登录知乎（手动登录，保存 Cookie）
 2. 爬取指定用户的所有回答和文章链接
-3. 爬取指定问题下的所有（或前 N 个）回答
-4. 爬取单个回答，可选附带评论区
-5. 逐个访问并提取内容，转为 Markdown 保存
-6. 内置反检测（stealth JS 注入、指纹伪装）
-7. 请求间隔随机延迟，降低被封风险
+3. 爬取指定用户的所有想法（Pins）
+4. 爬取指定问题下的所有（或前 N 个）回答
+5. 爬取单个回答，可选附带评论区
+6. 逐个访问并提取内容，转为 Markdown 保存
+7. 内置反检测（stealth JS 注入、指纹伪装）
+8. 请求间隔随机延迟，降低被封风险
 """
 
 import asyncio
@@ -297,6 +298,13 @@ async def collect_user_articles(page: Page, user_url_token: str) -> list[str]:
     return await _scroll_and_collect_links(page, url, css_selector, ["zhuanlan", "/p/"])
 
 
+async def collect_user_pins(page: Page, user_url_token: str) -> list[str]:
+    """收集用户的所有想法链接。"""
+    url = f"https://www.zhihu.com/people/{user_url_token}/pins"
+    css_selector = 'a[href*="/pin/"]'
+    return await _scroll_and_collect_links(page, url, css_selector, ["/pin/"])
+
+
 async def collect_question_answer_links(
     page: Page, question_id: str, max_answers: int | None = None
 ) -> list[str]:
@@ -555,6 +563,81 @@ async def extract_article(page: Page, url: str) -> dict:
     }
 
 
+async def extract_pin(page: Page, url: str) -> dict:
+    """
+    提取知乎想法内容。
+
+    Returns:
+        {"title": str, "author": str, "html": str, "date": str, "type": "pin", "url": str}
+    """
+    await page.goto(url, wait_until="domcontentloaded")
+    await page.wait_for_timeout(3000)
+    await _dismiss_popup(page)
+
+    # 检查反爬
+    text = await page.locator("body").inner_text()
+    if "40362" in text or "请求存在异常" in text:
+        raise Exception(f"触发知乎反爬 (40362): {url}")
+
+    # 等待内容加载
+    try:
+        await page.wait_for_selector(".PinItem, .RichContent, .Pin-content", timeout=15000)
+    except Exception:
+        pass
+
+    # 提取作者
+    author = await _safe_text(page, ".PinItem-author .UserLink-link", "未知作者")
+    if author == "未知作者":
+        author = await _safe_text(page, ".AuthorInfo-name .UserLink-link", "未知作者")
+
+    date = await _extract_date(page)
+
+    # 提取想法 HTML 内容
+    html = ""
+    for sel in [
+        ".PinItem .RichContent-inner",
+        ".PinItem .RichContent",
+        ".Pin-content .RichText",
+        ".RichText",
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0:
+                html = await loc.inner_html()
+                if html.strip():
+                    break
+        except Exception:
+            continue
+
+    if not html:
+        html = await page.locator("body").inner_html()
+
+    # 想法没有标题，用内容前 50 字作为标题
+    plain_text = await page.locator("body").inner_text()
+    # 从正文中提取前 50 字
+    for sel in [".PinItem .RichContent-inner", ".PinItem .RichContent", ".RichText"]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0:
+                plain_text = await loc.inner_text()
+                break
+        except Exception:
+            continue
+
+    title = plain_text.strip().replace("\n", " ")[:50]
+    if not title:
+        title = "想法"
+
+    return {
+        "title": title.strip(),
+        "author": author.strip(),
+        "html": html,
+        "date": date,
+        "type": "pin",
+        "url": url,
+    }
+
+
 # ── 评论提取 ─────────────────────────────────────────────────
 
 async def _fetch_comment_page(page: Page, url: str) -> dict:
@@ -572,9 +655,27 @@ async def _fetch_comment_page(page: Page, url: str) -> dict:
     """, url)
 
 
+def _get_comment_author(comment: dict) -> str:
+    """从评论数据中提取作者名。comment_v5 API 的 author 结构为 {name: ...}，无 member 层。"""
+    author = comment.get("author")
+    if isinstance(author, dict):
+        # comment_v5: author.name 直接可用
+        name = author.get("name")
+        if name:
+            return name
+        # 兼容旧版: author.member.name
+        member = author.get("member")
+        if isinstance(member, dict):
+            return member.get("name", "匿名用户")
+    return "匿名用户"
+
+
 async def extract_comments(page: Page, answer_id: str) -> list[dict]:
     """
     通过知乎 API 提取回答下的所有评论（包含子评论）。
+
+    comment_v5 API 使用游标分页（cursor-based pagination），
+    必须使用 paging.next 中的完整 URL 进行翻页，而非简单的整数 offset。
 
     Args:
         page: Playwright 页面对象（必须在知乎域名下）
@@ -586,56 +687,64 @@ async def extract_comments(page: Page, answer_id: str) -> list[dict]:
     print(f"   💬 正在获取评论...")
 
     all_comments = []
-    offset = 0
-    limit = 20
 
-    while True:
-        api_url = (
-            f"https://www.zhihu.com/api/v4/comment_v5/answers/{answer_id}"
-            f"/root_comment?order_by=score&limit={limit}&offset={offset}"
-        )
-        data = await _fetch_comment_page(page, api_url)
+    # 首次请求：offset 留空，API 会返回第一页
+    next_url = (
+        f"https://www.zhihu.com/api/v4/comment_v5/answers/{answer_id}"
+        f"/root_comment?order_by=score&limit=20&offset="
+    )
+
+    while next_url:
+        data = await _fetch_comment_page(page, next_url)
 
         if not data.get("data"):
             break
 
         for comment in data["data"]:
             root = {
-                "author": _nested_get(comment, "author", "member", "name") or "匿名用户",
+                "author": _get_comment_author(comment),
                 "content": comment.get("content", ""),
                 "created_time": comment.get("created_time", 0),
                 "like_count": comment.get("like_count", 0),
                 "child_comments": [],
             }
 
-            # 获取子评论
+            # 获取子评论（同样使用游标分页）
             child_count = comment.get("child_comment_count", 0)
             if child_count > 0:
                 comment_id = comment.get("id", "")
-                child_offset = 0
-                while True:
-                    child_url = (
-                        f"https://www.zhihu.com/api/v4/comment_v5/comment/{comment_id}"
-                        f"/child_comment?order_by=ts&limit=20&offset={child_offset}"
-                    )
-                    child_data = await _fetch_comment_page(page, child_url)
+                child_next_url = (
+                    f"https://www.zhihu.com/api/v4/comment_v5/comment/{comment_id}"
+                    f"/child_comment?order_by=ts&limit=20&offset="
+                )
+                while child_next_url:
+                    child_data = await _fetch_comment_page(page, child_next_url)
 
                     if not child_data.get("data"):
                         break
 
                     for child in child_data["data"]:
+                        reply_to_author = child.get("reply_to_author")
+                        reply_to_name = ""
+                        if isinstance(reply_to_author, dict):
+                            reply_to_name = reply_to_author.get("name", "")
+                            if not reply_to_name:
+                                member = reply_to_author.get("member")
+                                if isinstance(member, dict):
+                                    reply_to_name = member.get("name", "")
+
                         root["child_comments"].append({
-                            "author": _nested_get(child, "author", "member", "name") or "匿名用户",
+                            "author": _get_comment_author(child),
                             "content": child.get("content", ""),
                             "created_time": child.get("created_time", 0),
                             "like_count": child.get("like_count", 0),
-                            "reply_to": _nested_get(child, "reply_to_author", "member", "name") or "",
+                            "reply_to": reply_to_name,
                         })
 
-                    paging = child_data.get("paging", {})
-                    if paging.get("is_end", True):
+                    child_paging = child_data.get("paging", {})
+                    if child_paging.get("is_end", True):
                         break
-                    child_offset += 20
+                    child_next_url = child_paging.get("next", "")
                     await asyncio.sleep(0.3)
 
             all_comments.append(root)
@@ -643,7 +752,7 @@ async def extract_comments(page: Page, answer_id: str) -> list[dict]:
         paging = data.get("paging", {})
         if paging.get("is_end", True):
             break
-        offset += limit
+        next_url = paging.get("next", "")
         await asyncio.sleep(0.5)
 
     total = len(all_comments)
@@ -753,11 +862,13 @@ async def save_content_as_markdown(
     content_type = info["type"]
     url = info["url"]
 
-    type_label = "回答" if content_type == "answer" else "文章"
+    type_labels = {"answer": "回答", "article": "文章", "pin": "想法"}
+    type_dirs = {"answer": "answers", "article": "articles", "pin": "pins"}
+    type_label = type_labels.get(content_type, "内容")
     folder_name = sanitize_filename(f"[{date}] {title} - {author}")
 
     # 按类型分目录
-    type_dir = output_dir / ("answers" if content_type == "answer" else "articles")
+    type_dir = output_dir / type_dirs.get(content_type, "other")
     folder = type_dir / folder_name
     folder.mkdir(parents=True, exist_ok=True)
 
@@ -1197,6 +1308,147 @@ async def scrape_single_answer(
 
             print("\n" + "=" * 60)
             print("✨ 爬取完成！")
+            print(f"   输出目录: {output_dir.resolve()}")
+            print("=" * 60)
+
+        finally:
+            await context.close()
+
+
+async def scrape_user_pins(
+    user_url_token: str,
+    output_dir: Path | None = None,
+    download_img: bool = True,
+    delay_min: float = 5.0,
+    delay_max: float = 10.0,
+    headless: bool = False,
+):
+    """
+    爬取指定知乎用户的所有想法。
+
+    Args:
+        user_url_token: 知乎用户的 URL token
+        output_dir: 输出目录
+        download_img: 是否下载图片
+        delay_min: 请求间最小延迟（秒）
+        delay_max: 请求间最大延迟（秒）
+        headless: 是否使用无头模式
+    """
+    global MIN_DELAY, MAX_DELAY
+    MIN_DELAY = delay_min
+    MAX_DELAY = delay_max
+
+    if output_dir is None:
+        output_dir = DEFAULT_OUTPUT_DIR / sanitize_filename(user_url_token)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 60)
+    print(f"📚 开始爬取用户想法: {user_url_token}")
+    print(f"   输出目录: {output_dir.resolve()}")
+    print(f"   下载图片: {'是' if download_img else '否'}")
+    print(f"   请求延迟: {delay_min}-{delay_max} 秒")
+    print("=" * 60)
+
+    async with async_playwright() as pw:
+        context = await create_browser_context(pw, headless=headless)
+
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+
+            # ── 收集想法链接 ──
+            print("\n📝 正在收集想法列表...")
+            pin_urls = await collect_user_pins(page, user_url_token)
+            print(f"   共发现 {len(pin_urls)} 条想法")
+
+            if not pin_urls:
+                print("\n⚠️  未发现任何想法，请检查用户 URL token 是否正确。")
+                return
+
+            all_urls = [(url, "pin") for url in pin_urls]
+            total = len(all_urls)
+            print(f"\n🚀 共计 {total} 条想法待爬取\n")
+
+            # ── 保存链接列表 ──
+            links_file = output_dir / "pin_links.json"
+            links_data = [{"url": url, "type": "pin"} for url in pin_urls]
+            links_file.write_text(
+                json.dumps(links_data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print(f"📋 链接列表已保存到: {links_file}\n")
+
+            # ── 断点续传 ──
+            progress_file = output_dir / "pin_progress.json"
+            done_urls = set()
+            if progress_file.exists():
+                try:
+                    done_data = json.loads(progress_file.read_text(encoding="utf-8"))
+                    done_urls = set(done_data.get("done", []))
+                except Exception:
+                    pass
+
+            # 扫描磁盘上已存在的文件
+            disk_urls = _scan_done_urls_from_disk(output_dir)
+            if disk_urls - done_urls:
+                print(f"📂 从磁盘扫描发现 {len(disk_urls - done_urls)} 个已下载但未记录的内容")
+                done_urls |= disk_urls
+
+            if done_urls:
+                matched = sum(1 for url, _ in all_urls if url in done_urls)
+                if matched > 0:
+                    print(f"📌 检测到之前的进度，已完成 {matched}/{total} 项，将跳过。\n")
+
+                    progress_file.write_text(
+                        json.dumps({"done": list(done_urls)}, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+
+            # ── 逐个爬取 ──
+            success_count = 0
+            fail_count = 0
+
+            for idx, (url, content_type) in enumerate(all_urls, 1):
+                if url in done_urls:
+                    print(f"[{idx}/{total}] ⏭️  跳过（已完成）: {url}")
+                    success_count += 1
+                    continue
+
+                print(f"[{idx}/{total}] 📥 正在爬取想法: {url}")
+
+                try:
+                    info = await extract_pin(page, url)
+
+                    md_path = await save_content_as_markdown(info, output_dir, download_img)
+                    print(f"   💾 已保存: {md_path}")
+
+                    success_count += 1
+                    done_urls.add(url)
+
+                    progress_file.write_text(
+                        json.dumps({"done": list(done_urls)}, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+
+                except Exception as e:
+                    fail_count += 1
+                    print(f"   ❌ 失败: {e}")
+
+                    if "40362" in str(e) or "反爬" in str(e):
+                        extra_wait = 30 + random.random() * 30
+                        print(f"   ⚠️  触发反爬机制，额外等待 {extra_wait:.0f} 秒...")
+                        await asyncio.sleep(extra_wait)
+
+                # 请求间延迟
+                if idx < total:
+                    delay = random_delay()
+                    print(f"   ⏳ 等待 {delay:.1f} 秒...\n")
+                    await asyncio.sleep(delay)
+
+            # ── 汇总 ──
+            print("\n" + "=" * 60)
+            print("✨ 想法爬取完成！")
+            print(f"   成功: {success_count}")
+            print(f"   失败: {fail_count}")
             print(f"   输出目录: {output_dir.resolve()}")
             print("=" * 60)
 

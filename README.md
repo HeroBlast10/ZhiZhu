@@ -50,6 +50,7 @@
 | 能力 | 说明 |
 |:---|:---|
 | **用户级全量爬取** | 输入用户 URL token，自动收集该用户的全部回答与文章 |
+| **用户想法爬取** | 爬取指定用户的所有知乎想法（Pins） |
 | **问题级爬取** | 爬取指定问题下的全部或前 N 个回答 |
 | **单回答爬取** | 精准爬取某个特定回答，可选附带完整评论区 |
 | **评论区提取** | 通过知乎 API 获取全部根评论与子评论，格式化为 Markdown |
@@ -128,9 +129,16 @@ python main.py answer https://www.zhihu.com/question/12345/answer/67890
 python main.py answer https://www.zhihu.com/question/12345/answer/67890 --with-comments
 ```
 
-### 6. 通用选项
+### 6. 爬取用户想法
 
-以下选项适用于 `scrape`、`question`、`answer` 三个命令：
+```bash
+# 爬取某用户的所有想法
+python main.py pins zhang-jia-wei
+```
+
+### 7. 通用选项
+
+以下选项适用于 `scrape`、`question`、`answer`、`pins` 所有命令：
 
 ```bash
 # 不下载图片（加快速度）
@@ -151,6 +159,7 @@ python main.py answer https://www.zhihu.com/question/12345/answer/67890 --with-c
 python main.py scrape zhang-jia-wei --only-answers --no-images --headless
 python main.py question 12345 -n 10 --delay-min 15 --delay-max 30
 python main.py answer https://www.zhihu.com/question/12345/answer/67890 --with-comments --output ./data
+python main.py pins zhang-jia-wei --no-images
 ```
 
 ---
@@ -167,8 +176,13 @@ output/
     │   │   ├── index.md        # Markdown 内容
     │   │   └── images/         # 本地化图片
     │   └── ...
-    └── articles/               # 文章
-        ├── [2024-02-01] 文章标题 - 作者/
+    ├── articles/               # 文章
+    │   ├── [2024-02-01] 文章标题 - 作者/
+    │   │   ├── index.md
+    │   │   └── images/
+    │   └── ...
+    └── pins/                   # 想法
+        ├── [2024-03-01] 想法内容前50字 - 作者/
         │   ├── index.md
         │   └── images/
         └── ...
