@@ -207,9 +207,11 @@ async def _scroll_and_collect_links(
 
     collected_links = set()
     no_new_count = 0
-    max_no_new = 5  # 连续 5 次滚动没有新链接则认为到底了
+    max_no_new = 10  # 连续 10 次滚动没有新链接则认为到底了
 
     scroll_count = 0
+    prev_scroll_height = 0
+
     while no_new_count < max_no_new:
         # 使用 CSS 选择器提取链接（比 JS 正则更可靠）
         link_elements = await page.query_selector_all(css_selector)
@@ -240,24 +242,35 @@ async def _scroll_and_collect_links(
         print(f"   📜 第 {scroll_count} 次滚动，已发现 {len(collected_links)} 个链接"
               + (f"（新增 {new_count}）" if new_count > 0 else "（无新增）"))
 
-        # 检查是否到达页面底部
-        at_bottom = await page.evaluate("""() => {
+        # 检查页面是否包含明确的"到底"标识
+        end_marker = await page.evaluate("""() => {
             const bodyText = document.body.innerText;
-            if (bodyText.includes('已显示全部') || bodyText.includes('没有更多了')) {
-                return true;
-            }
-            // 检查是否滚动到底部
-            return (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 200);
+            return bodyText.includes('已显示全部') || bodyText.includes('没有更多了');
         }""")
 
-        if at_bottom and no_new_count >= 2:
-            print("   📋 已到达列表底部。")
+        if end_marker and no_new_count >= 3:
+            print("   📋 已到达列表底部（页面提示已显示全部）。")
+            break
+
+        # 检查页面高度是否还在增长（懒加载是否还在工作）
+        current_scroll_height = await page.evaluate("document.body.scrollHeight")
+        height_changed = current_scroll_height != prev_scroll_height
+        prev_scroll_height = current_scroll_height
+
+        # 只有在页面高度不再变化且连续多次无新链接时才认为到底
+        if not height_changed and no_new_count >= 5:
+            print("   📋 页面不再加载新内容，停止滚动。")
             break
 
         # 滚动
         scroll_distance = random.randint(800, 1500)
         await page.evaluate(f"window.scrollBy(0, {scroll_distance})")
-        await asyncio.sleep(1.5 + random.random() * 2)
+
+        # 等待新内容加载：先等固定时间，再等页面高度变化或超时
+        await asyncio.sleep(2.0 + random.random() * 2)
+        # 额外等待：如果上次没有新链接，多等一会让懒加载有时间完成
+        if new_count == 0:
+            await asyncio.sleep(2.0)
 
     return sorted(collected_links)
 
@@ -302,8 +315,9 @@ async def collect_question_answer_links(
 
     collected_links = set()
     no_new_count = 0
-    max_no_new = 5
+    max_no_new = 10
     scroll_count = 0
+    prev_scroll_height = 0
 
     while no_new_count < max_no_new:
         # 使用 CSS 选择器提取回答链接
@@ -339,23 +353,32 @@ async def collect_question_answer_links(
             print(f"   📋 已达到目标数量 {max_answers}。")
             break
 
-        # 检查是否到达页面底部
-        at_bottom = await page.evaluate("""() => {
+        # 检查页面是否包含明确的"到底"标识
+        end_marker = await page.evaluate("""() => {
             const bodyText = document.body.innerText;
-            if (bodyText.includes('已显示全部') || bodyText.includes('没有更多了')) {
-                return true;
-            }
-            return (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 200);
+            return bodyText.includes('已显示全部') || bodyText.includes('没有更多了');
         }""")
 
-        if at_bottom and no_new_count >= 2:
-            print("   📋 已到达列表底部。")
+        if end_marker and no_new_count >= 3:
+            print("   📋 已到达列表底部（页面提示已显示全部）。")
+            break
+
+        # 检查页面高度是否还在增长
+        current_scroll_height = await page.evaluate("document.body.scrollHeight")
+        height_changed = current_scroll_height != prev_scroll_height
+        prev_scroll_height = current_scroll_height
+
+        if not height_changed and no_new_count >= 5:
+            print("   📋 页面不再加载新内容，停止滚动。")
             break
 
         # 滚动
         scroll_distance = random.randint(800, 1500)
         await page.evaluate(f"window.scrollBy(0, {scroll_distance})")
-        await asyncio.sleep(1.5 + random.random() * 2)
+
+        await asyncio.sleep(2.0 + random.random() * 2)
+        if new_count == 0:
+            await asyncio.sleep(2.0)
 
     result = sorted(collected_links)
     if max_answers:
