@@ -1,12 +1,14 @@
 """
-scraper.py — 知乎用户内容爬虫核心模块
+scraper.py — 知乎内容爬虫核心模块
 
 功能：
 1. 使用 Playwright 持久化上下文登录知乎（手动登录，保存 Cookie）
 2. 爬取指定用户的所有回答和文章链接
-3. 逐个访问并提取内容，转为 Markdown 保存
-4. 内置反检测（stealth JS 注入、指纹伪装）
-5. 请求间隔随机延迟，降低被封风险
+3. 爬取指定问题下的所有（或前 N 个）回答
+4. 爬取单个回答，可选附带评论区
+5. 逐个访问并提取内容，转为 Markdown 保存
+6. 内置反检测（stealth JS 注入、指纹伪装）
+7. 请求间隔随机延迟，降低被封风险
 """
 
 import asyncio
@@ -60,6 +62,42 @@ def sanitize_filename(name: str) -> str:
 def random_delay():
     """返回一个随机延迟时间。"""
     return MIN_DELAY + random.random() * (MAX_DELAY - MIN_DELAY)
+
+
+def _nested_get(d: dict, *keys):
+    """安全地从嵌套字典中获取值。"""
+    for key in keys:
+        if isinstance(d, dict):
+            d = d.get(key, {})
+        else:
+            return None
+    return d if d != {} else None
+
+
+def parse_question_id(input_str: str) -> str:
+    """从 URL 或纯数字中提取问题 ID。"""
+    match = re.search(r'question/(\d+)', input_str)
+    if match:
+        return match.group(1)
+    if input_str.strip().isdigit():
+        return input_str.strip()
+    raise ValueError(f"无法识别问题 ID: {input_str}")
+
+
+def parse_answer_url(input_str: str) -> tuple[str, str, str]:
+    """
+    从 URL 中提取信息，返回 (完整 URL, 问题 ID, 回答 ID)。
+
+    支持格式:
+        https://www.zhihu.com/question/12345/answer/67890
+        /question/12345/answer/67890
+    """
+    match = re.search(r'question/(\d+)/answer/(\d+)', input_str)
+    if match:
+        qid, aid = match.group(1), match.group(2)
+        full_url = f"https://www.zhihu.com/question/{qid}/answer/{aid}"
+        return full_url, qid, aid
+    raise ValueError(f"无法识别回答 URL: {input_str}")
 
 
 # ── 浏览器上下文管理 ─────────────────────────────────────────
@@ -240,6 +278,91 @@ async def collect_user_articles(page: Page, user_url_token: str) -> list[str]:
     return await _scroll_and_collect_links(page, url, css_selector, ["zhuanlan", "/p/"])
 
 
+async def collect_question_answer_links(
+    page: Page, question_id: str, max_answers: int | None = None
+) -> list[str]:
+    """
+    在问题页面中滚动，收集回答链接。
+
+    Args:
+        page: Playwright 页面对象
+        question_id: 知乎问题 ID
+        max_answers: 最多收集的回答数量（None 表示全部）
+
+    Returns:
+        去重后的回答链接列表
+    """
+    url = f"https://www.zhihu.com/question/{question_id}"
+    print(f"🌍 访问: {url}")
+    await page.goto(url, wait_until="domcontentloaded")
+    await asyncio.sleep(5)
+
+    # 关闭可能的登录弹窗
+    await _dismiss_popup(page)
+
+    collected_links = set()
+    no_new_count = 0
+    max_no_new = 5
+    scroll_count = 0
+
+    while no_new_count < max_no_new:
+        # 使用 CSS 选择器提取回答链接
+        link_elements = await page.query_selector_all('a[href*="/answer/"]')
+        links = []
+        for el in link_elements:
+            href = await el.get_attribute("href")
+            if href:
+                if href.startswith("//"):
+                    href = "https:" + href
+                elif href.startswith("/"):
+                    href = "https://www.zhihu.com" + href
+                elif not href.startswith("http"):
+                    href = "https://www.zhihu.com/" + href
+                if f"/question/{question_id}/answer/" in href:
+                    links.append(href.split("?")[0])
+
+        prev_count = len(collected_links)
+        collected_links.update(links)
+        new_count = len(collected_links) - prev_count
+
+        if new_count == 0:
+            no_new_count += 1
+        else:
+            no_new_count = 0
+
+        scroll_count += 1
+        print(f"   📜 第 {scroll_count} 次滚动，已发现 {len(collected_links)} 个回答链接"
+              + (f"（新增 {new_count}）" if new_count > 0 else "（无新增）"))
+
+        # 检查是否已达到目标数量
+        if max_answers and len(collected_links) >= max_answers:
+            print(f"   📋 已达到目标数量 {max_answers}。")
+            break
+
+        # 检查是否到达页面底部
+        at_bottom = await page.evaluate("""() => {
+            const bodyText = document.body.innerText;
+            if (bodyText.includes('已显示全部') || bodyText.includes('没有更多了')) {
+                return true;
+            }
+            return (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 200);
+        }""")
+
+        if at_bottom and no_new_count >= 2:
+            print("   📋 已到达列表底部。")
+            break
+
+        # 滚动
+        scroll_distance = random.randint(800, 1500)
+        await page.evaluate(f"window.scrollBy(0, {scroll_distance})")
+        await asyncio.sleep(1.5 + random.random() * 2)
+
+    result = sorted(collected_links)
+    if max_answers:
+        result = result[:max_answers]
+    return result
+
+
 # ── 页面内容提取 ─────────────────────────────────────────────
 
 async def _dismiss_popup(page: Page) -> None:
@@ -399,6 +522,140 @@ async def extract_article(page: Page, url: str) -> dict:
     }
 
 
+# ── 评论提取 ─────────────────────────────────────────────────
+
+async def _fetch_comment_page(page: Page, url: str) -> dict:
+    """通过浏览器 fetch 获取一页评论数据。"""
+    return await page.evaluate("""
+        async (url) => {
+            try {
+                const resp = await fetch(url, { credentials: 'include' });
+                if (!resp.ok) return { data: [], paging: { is_end: true } };
+                return await resp.json();
+            } catch (e) {
+                return { data: [], paging: { is_end: true } };
+            }
+        }
+    """, url)
+
+
+async def extract_comments(page: Page, answer_id: str) -> list[dict]:
+    """
+    通过知乎 API 提取回答下的所有评论（包含子评论）。
+
+    Args:
+        page: Playwright 页面对象（必须在知乎域名下）
+        answer_id: 回答 ID
+
+    Returns:
+        评论列表，每个评论包含 author, content, created_time, like_count, child_comments
+    """
+    print(f"   💬 正在获取评论...")
+
+    all_comments = []
+    offset = 0
+    limit = 20
+
+    while True:
+        api_url = (
+            f"https://www.zhihu.com/api/v4/comment_v5/answers/{answer_id}"
+            f"/root_comment?order_by=score&limit={limit}&offset={offset}"
+        )
+        data = await _fetch_comment_page(page, api_url)
+
+        if not data.get("data"):
+            break
+
+        for comment in data["data"]:
+            root = {
+                "author": _nested_get(comment, "author", "member", "name") or "匿名用户",
+                "content": comment.get("content", ""),
+                "created_time": comment.get("created_time", 0),
+                "like_count": comment.get("like_count", 0),
+                "child_comments": [],
+            }
+
+            # 获取子评论
+            child_count = comment.get("child_comment_count", 0)
+            if child_count > 0:
+                comment_id = comment.get("id", "")
+                child_offset = 0
+                while True:
+                    child_url = (
+                        f"https://www.zhihu.com/api/v4/comment_v5/comment/{comment_id}"
+                        f"/child_comment?order_by=ts&limit=20&offset={child_offset}"
+                    )
+                    child_data = await _fetch_comment_page(page, child_url)
+
+                    if not child_data.get("data"):
+                        break
+
+                    for child in child_data["data"]:
+                        root["child_comments"].append({
+                            "author": _nested_get(child, "author", "member", "name") or "匿名用户",
+                            "content": child.get("content", ""),
+                            "created_time": child.get("created_time", 0),
+                            "like_count": child.get("like_count", 0),
+                            "reply_to": _nested_get(child, "reply_to_author", "member", "name") or "",
+                        })
+
+                    paging = child_data.get("paging", {})
+                    if paging.get("is_end", True):
+                        break
+                    child_offset += 20
+                    await asyncio.sleep(0.3)
+
+            all_comments.append(root)
+
+        paging = data.get("paging", {})
+        if paging.get("is_end", True):
+            break
+        offset += limit
+        await asyncio.sleep(0.5)
+
+    total = len(all_comments)
+    child_total = sum(len(c["child_comments"]) for c in all_comments)
+    print(f"   💬 共获取 {total} 条根评论，{child_total} 条子评论")
+
+    return all_comments
+
+
+def format_comments_markdown(comments: list[dict]) -> str:
+    """将评论数据格式化为 Markdown 文本。"""
+    if not comments:
+        return ""
+
+    lines = ["\n\n---\n", "## 评论区\n"]
+
+    for i, comment in enumerate(comments, 1):
+        ts = comment.get("created_time", 0)
+        time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "未知时间"
+        author = comment.get("author", "匿名用户")
+        likes = comment.get("like_count", 0)
+        content = comment.get("content", "")
+
+        lines.append(f"### {i}楼 · {author} · {time_str} · 👍 {likes}\n")
+        lines.append(f"{content}\n")
+
+        # 子评论
+        for child in comment.get("child_comments", []):
+            child_ts = child.get("created_time", 0)
+            child_time = datetime.fromtimestamp(child_ts).strftime("%Y-%m-%d %H:%M") if child_ts else "未知时间"
+            child_author = child.get("author", "匿名用户")
+            child_likes = child.get("like_count", 0)
+            child_content = child.get("content", "")
+            reply_to = child.get("reply_to", "")
+
+            reply_prefix = f"回复 {reply_to} " if reply_to else ""
+            lines.append(f"> **{child_author}** {reply_prefix}· {child_time} · 👍 {child_likes}  ")
+            lines.append(f"> {child_content}")
+            lines.append(">")
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 # ── 图片下载 ─────────────────────────────────────────────────
 
 async def download_images(img_urls: list[str], dest: Path) -> dict[str, str]:
@@ -441,7 +698,8 @@ async def download_images(img_urls: list[str], dest: Path) -> dict[str, str]:
 # ── 保存单篇内容为 Markdown ──────────────────────────────────
 
 async def save_content_as_markdown(
-    info: dict, output_dir: Path, download_img: bool = True
+    info: dict, output_dir: Path, download_img: bool = True,
+    comments: list[dict] | None = None,
 ) -> Path:
     """
     将提取到的内容保存为 Markdown 文件。
@@ -450,6 +708,7 @@ async def save_content_as_markdown(
         info: extract_answer 或 extract_article 返回的字典
         output_dir: 输出根目录
         download_img: 是否下载图片到本地
+        comments: 评论列表（可选，传入则追加评论区）
 
     Returns:
         保存的文件路径
@@ -497,7 +756,13 @@ async def save_content_as_markdown(
     )
 
     md_path = folder / "index.md"
-    md_path.write_text(header + md, encoding="utf-8")
+
+    # 拼接评论区
+    comments_md = ""
+    if comments:
+        comments_md = format_comments_markdown(comments)
+
+    md_path.write_text(header + md + comments_md, encoding="utf-8")
 
     return md_path
 
@@ -650,6 +915,204 @@ async def scrape_user(
             print("✨ 爬取完成！")
             print(f"   成功: {success_count}")
             print(f"   失败: {fail_count}")
+            print(f"   输出目录: {output_dir.resolve()}")
+            print("=" * 60)
+
+        finally:
+            await context.close()
+
+
+async def scrape_question(
+    question_input: str,
+    max_answers: int | None = None,
+    output_dir: Path | None = None,
+    download_img: bool = True,
+    delay_min: float = 10.0,
+    delay_max: float = 20.0,
+    headless: bool = False,
+):
+    """
+    爬取指定知乎问题下的回答。
+
+    Args:
+        question_input: 问题 URL 或纯数字 ID
+        max_answers: 最多爬取的回答数量（None 表示全部）
+        output_dir: 输出目录
+        download_img: 是否下载图片
+        delay_min: 请求间最小延迟（秒）
+        delay_max: 请求间最大延迟（秒）
+        headless: 是否使用无头模式
+    """
+    global MIN_DELAY, MAX_DELAY
+    MIN_DELAY = delay_min
+    MAX_DELAY = delay_max
+
+    question_id = parse_question_id(question_input)
+
+    if output_dir is None:
+        output_dir = DEFAULT_OUTPUT_DIR / f"question_{question_id}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    limit_str = f"前 {max_answers} 个" if max_answers else "全部"
+
+    print("=" * 60)
+    print(f"📚 开始爬取问题: {question_id}")
+    print(f"   问题链接: https://www.zhihu.com/question/{question_id}")
+    print(f"   爬取数量: {limit_str}")
+    print(f"   输出目录: {output_dir.resolve()}")
+    print(f"   下载图片: {'是' if download_img else '否'}")
+    print(f"   请求延迟: {delay_min}-{delay_max} 秒")
+    print("=" * 60)
+
+    async with async_playwright() as pw:
+        context = await create_browser_context(pw, headless=headless)
+
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+
+            # ── 收集回答链接 ──
+            print("\n📝 正在收集回答列表...")
+            answer_urls = await collect_question_answer_links(page, question_id, max_answers)
+            print(f"   共发现 {len(answer_urls)} 个回答")
+
+            if not answer_urls:
+                print("\n⚠️  未发现任何回答，请检查问题 ID 是否正确。")
+                return
+
+            total = len(answer_urls)
+            print(f"\n🚀 共计 {total} 个回答待爬取\n")
+
+            # ── 保存链接列表 ──
+            links_file = output_dir / "links.json"
+            links_data = [{"url": url, "type": "answer"} for url in answer_urls]
+            links_file.write_text(
+                json.dumps(links_data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print(f"📋 链接列表已保存到: {links_file}\n")
+
+            # ── 断点续传 ──
+            progress_file = output_dir / "progress.json"
+            done_urls = set()
+            if progress_file.exists():
+                try:
+                    done_data = json.loads(progress_file.read_text(encoding="utf-8"))
+                    done_urls = set(done_data.get("done", []))
+                    if done_urls:
+                        print(f"📌 检测到之前的进度，已完成 {len(done_urls)} 项，将跳过。\n")
+                except Exception:
+                    pass
+
+            # ── 逐个爬取 ──
+            success_count = 0
+            fail_count = 0
+
+            for idx, url in enumerate(answer_urls, 1):
+                if url in done_urls:
+                    print(f"[{idx}/{total}] ⏭️  跳过（已完成）: {url}")
+                    success_count += 1
+                    continue
+
+                print(f"[{idx}/{total}] 📥 正在爬取回答: {url}")
+
+                try:
+                    info = await extract_answer(page, url)
+                    md_path = await save_content_as_markdown(info, output_dir, download_img)
+                    print(f"   💾 已保存: {md_path}")
+
+                    success_count += 1
+                    done_urls.add(url)
+
+                    progress_file.write_text(
+                        json.dumps({"done": list(done_urls)}, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+
+                except Exception as e:
+                    fail_count += 1
+                    print(f"   ❌ 失败: {e}")
+
+                    if "40362" in str(e) or "反爬" in str(e):
+                        extra_wait = 30 + random.random() * 30
+                        print(f"   ⚠️  触发反爬机制，额外等待 {extra_wait:.0f} 秒...")
+                        await asyncio.sleep(extra_wait)
+
+                if idx < total:
+                    delay = random_delay()
+                    print(f"   ⏳ 等待 {delay:.1f} 秒...\n")
+                    await asyncio.sleep(delay)
+
+            # ── 问题爬取汇总 ──
+            print("\n" + "=" * 60)
+            print("✨ 问题回答爬取完成！")
+            print(f"   成功: {success_count}")
+            print(f"   失败: {fail_count}")
+            print(f"   输出目录: {output_dir.resolve()}")
+            print("=" * 60)
+
+        finally:
+            await context.close()
+
+
+async def scrape_single_answer(
+    answer_input: str,
+    output_dir: Path | None = None,
+    download_img: bool = True,
+    with_comments: bool = False,
+    delay_min: float = 10.0,
+    delay_max: float = 20.0,
+    headless: bool = False,
+):
+    """
+    爬取单个知乎回答（可选附带评论区）。
+
+    Args:
+        answer_input: 回答 URL（包含 /question/xxx/answer/xxx）
+        output_dir: 输出目录
+        download_img: 是否下载图片
+        with_comments: 是否同时爬取评论区
+        delay_min: 请求间最小延迟（秒）
+        delay_max: 请求间最大延迟（秒）
+        headless: 是否使用无头模式
+    """
+    global MIN_DELAY, MAX_DELAY
+    MIN_DELAY = delay_min
+    MAX_DELAY = delay_max
+
+    answer_url, question_id, answer_id = parse_answer_url(answer_input)
+
+    if output_dir is None:
+        output_dir = DEFAULT_OUTPUT_DIR / f"answer_{answer_id}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 60)
+    print(f"📚 爬取单个回答")
+    print(f"   回答链接: {answer_url}")
+    print(f"   包含评论: {'是' if with_comments else '否'}")
+    print(f"   输出目录: {output_dir.resolve()}")
+    print(f"   下载图片: {'是' if download_img else '否'}")
+    print("=" * 60)
+
+    async with async_playwright() as pw:
+        context = await create_browser_context(pw, headless=headless)
+
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+
+            print(f"\n📥 正在爬取回答: {answer_url}")
+            info = await extract_answer(page, answer_url)
+
+            # 获取评论
+            comments = None
+            if with_comments:
+                comments = await extract_comments(page, answer_id)
+
+            md_path = await save_content_as_markdown(
+                info, output_dir, download_img, comments=comments
+            )
+            print(f"   💾 已保存: {md_path}")
+
+            print("\n" + "=" * 60)
+            print("✨ 爬取完成！")
             print(f"   输出目录: {output_dir.resolve()}")
             print("=" * 60)
 

@@ -50,6 +50,9 @@
 | 能力 | 说明 |
 |:---|:---|
 | **用户级全量爬取** | 输入用户 URL token，自动收集该用户的全部回答与文章 |
+| **问题级爬取** | 爬取指定问题下的全部或前 N 个回答 |
+| **单回答爬取** | 精准爬取某个特定回答，可选附带完整评论区 |
+| **评论区提取** | 通过知乎 API 获取全部根评论与子评论，格式化为 Markdown |
 | **浏览器指纹伪装** | 内置 WebGL、Canvas、AudioContext 等多维度反检测机制 |
 | **智能延迟策略** | 请求间随机等待 10-20 秒（可自定义），以时间换安全 |
 | **断点续传** | 自动记录进度，中断后重新运行即从上次位置继续 |
@@ -102,26 +105,52 @@ https://www.zhihu.com/people/zhang-jia-wei
                              ^^^^^^^^^^^^^^ 这部分
 ```
 
-### 4. 进阶选项
+### 4. 爬取问题下的回答
 
 ```bash
-# 只爬取回答
-python main.py scrape zhang-jia-wei --only-answers
+# 爬取某个问题下的全部回答
+python main.py question https://www.zhihu.com/question/12345
 
-# 只爬取文章
-python main.py scrape zhang-jia-wei --only-articles
+# 也可以直接用问题 ID
+python main.py question 12345
 
+# 只爬取默认排序下的前 20 个回答
+python main.py question 12345 -n 20
+```
+
+### 5. 爬取单个回答
+
+```bash
+# 爬取某个特定回答
+python main.py answer https://www.zhihu.com/question/12345/answer/67890
+
+# 爬取回答并附带完整评论区
+python main.py answer https://www.zhihu.com/question/12345/answer/67890 --with-comments
+```
+
+### 6. 通用选项
+
+以下选项适用于 `scrape`、`question`、`answer` 三个命令：
+
+```bash
 # 不下载图片（加快速度）
-python main.py scrape zhang-jia-wei --no-images
+--no-images
 
 # 自定义延迟（更安全）
-python main.py scrape zhang-jia-wei --delay-min 15 --delay-max 30
+--delay-min 15 --delay-max 30
 
 # 指定输出目录
-python main.py scrape zhang-jia-wei --output ./my_backup
+--output ./my_backup
 
 # 无头模式（不显示浏览器窗口）
-python main.py scrape zhang-jia-wei --headless
+--headless
+```
+
+示例：
+```bash
+python main.py scrape zhang-jia-wei --only-answers --no-images --headless
+python main.py question 12345 -n 10 --delay-min 15 --delay-max 30
+python main.py answer https://www.zhihu.com/question/12345/answer/67890 --with-comments --output ./data
 ```
 
 ---
