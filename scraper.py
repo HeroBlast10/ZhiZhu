@@ -800,6 +800,29 @@ async def save_content_as_markdown(
     return md_path
 
 
+def _scan_done_urls_from_disk(output_dir: Path) -> set[str]:
+    """
+    扫描输出目录中已存在的 Markdown 文件，从文件头部提取来源 URL。
+    这样即使 progress.json 丢失或不完整，已下载的内容也不会被重复爬取。
+    """
+    done = set()
+    url_pattern = re.compile(r'>\s*\*\*来源\*\*:\s*\[([^\]]+)\]')
+    for subdir in ("answers", "articles"):
+        type_dir = output_dir / subdir
+        if not type_dir.exists():
+            continue
+        for md_file in type_dir.rglob("index.md"):
+            try:
+                # 只读前 500 字节即可，URL 在文件头部
+                text = md_file.read_text(encoding="utf-8")[:500]
+                m = url_pattern.search(text)
+                if m:
+                    done.add(m.group(1))
+            except Exception:
+                pass
+    return done
+
+
 # ── 主爬取流程 ────────────────────────────────────────────────
 
 async def scrape_user(
@@ -892,10 +915,25 @@ async def scrape_user(
                 try:
                     done_data = json.loads(progress_file.read_text(encoding="utf-8"))
                     done_urls = set(done_data.get("done", []))
-                    if done_urls:
-                        print(f"📌 检测到之前的进度，已完成 {len(done_urls)} 项，将跳过。\n")
                 except Exception:
                     pass
+
+            # 扫描磁盘上已存在的文件，补充 progress.json 可能遗漏的记录
+            disk_urls = _scan_done_urls_from_disk(output_dir)
+            if disk_urls - done_urls:
+                print(f"📂 从磁盘扫描发现 {len(disk_urls - done_urls)} 个已下载但未记录的内容")
+                done_urls |= disk_urls
+
+            if done_urls:
+                # 只统计与当前链接列表匹配的数量
+                matched = sum(1 for url, _ in all_urls if url in done_urls)
+                print(f"📌 检测到之前的进度，已完成 {matched}/{total} 项，将跳过。\n")
+
+                # 同步更新 progress.json
+                progress_file.write_text(
+                    json.dumps({"done": list(done_urls)}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
 
             # ── 逐个爬取 ──
             success_count = 0
@@ -1030,10 +1068,23 @@ async def scrape_question(
                 try:
                     done_data = json.loads(progress_file.read_text(encoding="utf-8"))
                     done_urls = set(done_data.get("done", []))
-                    if done_urls:
-                        print(f"📌 检测到之前的进度，已完成 {len(done_urls)} 项，将跳过。\n")
                 except Exception:
                     pass
+
+            # 扫描磁盘上已存在的文件，补充 progress.json 可能遗漏的记录
+            disk_urls = _scan_done_urls_from_disk(output_dir)
+            if disk_urls - done_urls:
+                print(f"📂 从磁盘扫描发现 {len(disk_urls - done_urls)} 个已下载但未记录的内容")
+                done_urls |= disk_urls
+
+            if done_urls:
+                matched = sum(1 for u in answer_urls if u in done_urls)
+                print(f"📌 检测到之前的进度，已完成 {matched}/{total} 项，将跳过。\n")
+
+                progress_file.write_text(
+                    json.dumps({"done": list(done_urls)}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
 
             # ── 逐个爬取 ──
             success_count = 0
