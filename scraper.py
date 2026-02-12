@@ -262,11 +262,17 @@ async def _scroll_and_collect_links(
             print("   📋 页面不再加载新内容，停止滚动。")
             break
 
-        # 滚动
+        # 滚动 — 使用多种方式触发知乎的懒加载
+        # window.scrollBy 无法触发知乎的 scroll 事件监听器，
+        # 必须使用键盘 End 键或直接操作 documentElement.scrollTop
         scroll_distance = random.randint(800, 1500)
-        await page.evaluate(f"window.scrollBy(0, {scroll_distance})")
+        await page.keyboard.press("End")
+        await asyncio.sleep(0.5)
+        await page.evaluate(f"document.documentElement.scrollTop += {scroll_distance}")
+        await asyncio.sleep(0.3)
+        await page.keyboard.press("End")
 
-        # 等待新内容加载：先等固定时间，再等页面高度变化或超时
+        # 等待新内容加载
         await asyncio.sleep(2.0 + random.random() * 2)
         # 额外等待：如果上次没有新链接，多等一会让懒加载有时间完成
         if new_count == 0:
@@ -372,9 +378,13 @@ async def collect_question_answer_links(
             print("   📋 页面不再加载新内容，停止滚动。")
             break
 
-        # 滚动
+        # 滚动 — 使用多种方式触发知乎的懒加载
         scroll_distance = random.randint(800, 1500)
-        await page.evaluate(f"window.scrollBy(0, {scroll_distance})")
+        await page.keyboard.press("End")
+        await asyncio.sleep(0.5)
+        await page.evaluate(f"document.documentElement.scrollTop += {scroll_distance}")
+        await asyncio.sleep(0.3)
+        await page.keyboard.press("End")
 
         await asyncio.sleep(2.0 + random.random() * 2)
         if new_count == 0:
