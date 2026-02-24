@@ -43,13 +43,13 @@ def _add_common_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--delay-min",
         type=float,
-        default=10.0,
+        default=5.0,
         help="请求间最小延迟秒数（默认 10）",
     )
     parser.add_argument(
         "--delay-max",
         type=float,
-        default=20.0,
+        default=10.0,
         help="请求间最大延迟秒数（默认 20）",
     )
     parser.add_argument(

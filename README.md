@@ -2,7 +2,7 @@
 
 # ZhiZhu (知蛛)
 
-### *编织你的精神镜像*
+### *编织你的知乎精神镜像*
 
 **Reclaim your digital mind.**
 
@@ -22,7 +22,7 @@
 
 然而，散落在互联网角落的数据是脆弱的，也是割裂的。
 
-**ZhiZhu (知蛛)** 不仅仅是一个爬虫。它是一台时光穿梭机，也是一位数字考古学家。它致力于将你流落在云端的精神财富，以最纯粹、最通用的 Markdown 格式完整带回本地。无论是精妙的 LaTeX 数学公式，还是承载记忆的图片，都力求高保真还原。
+**ZhiZhu (知蛛)** 是一台时光穿梭机，也是一位数字考古学家。它致力于将你流落在知乎的精神财富，以最纯粹、最通用的 Markdown 格式完整带回本地。无论是精妙的 LaTeX 数学公式，还是承载记忆的图片，都力求高保真还原。
 
 > *Archiving the past to compute the future.*
 > *归档过去，为了计算未来。*
@@ -141,7 +141,7 @@ python main.py pins zhang-jia-wei
 以下选项适用于 `scrape`、`question`、`answer`、`pins` 所有命令：
 
 ```bash
-# 不下载图片（加快速度）
+# 不下载图片（加快速度，启用纯文本模式）
 --no-images
 
 # 自定义延迟（更安全）
@@ -166,7 +166,9 @@ python main.py pins zhang-jia-wei --no-images
 
 ## 输出结构
 
-```
+默认情况下（下载图片，推荐用于高保真归档），输出结构如下：
+
+```text
 output/
 └── zhang-jia-wei/
     ├── links.json              # 所有链接列表
@@ -188,6 +190,25 @@ output/
         └── ...
 ```
 
+如果使用 `--no-images`（纯文本模式），则不再为每篇内容创建子文件夹，所有 Markdown 文件会直接放在类型目录下，文件名为 `日期_标题.md`，且文中图片使用占位符 `[图片]` 表示，不包含本地图片路径：
+
+```text
+output/
+└── zhang-jia-wei/
+    ├── links.json
+    ├── progress.json
+    ├── answers/
+    │   ├── 2025-02-10_如何看待猫眼预测《哪吒 2》票房最终将达到 120 亿？.md
+    │   ├── 2025-04-05_在你所知道的历史或体育赛事中，“Speed” 在 4 月 4 日的那次表现有什么特别之处？.md
+    │   └── ...
+    ├── articles/
+    │   ├── 2024-02-01_文章标题示例.md
+    │   └── ...
+    └── pins/
+        ├── 2024-03-01_想法内容前50字示例.md
+        └── ...
+```
+
 ## 断点续传
 
 爬取过程中如果中断（网络问题、手动中止等），重新运行相同命令即可从断点继续：
@@ -196,6 +217,32 @@ output/
 # 程序会自动检测 progress.json，跳过已完成的内容
 python main.py scrape zhang-jia-wei
 ```
+
+---
+
+## 合并多个 Markdown 为单个文档
+
+ZhiZhu 附带了一个简单的合并脚本 `merge_md.py`，可以把某个目录下的所有 `.md` 文件合并成一个大纲清晰的 Markdown 文件，方便导入到笔记软件或作为语料输入给 LLM。
+
+常见用法示例（在项目根目录执行）：
+
+```bash
+# 合并某用户的所有回答（output/heroblast/answers 下的所有 .md）
+python merge_md.py output/heroblast/answers
+
+# 合并某个问题下的所有回答，并指定输出文件名
+python merge_md.py output/question_46631426/answers -o output/gp_qa_merged.md
+
+# 按文件名排序（默认按文件内部的日期字段排序）
+python merge_md.py output/heroblast/answers --sort-by name
+
+# 自定义总标题与分隔符
+python merge_md.py output/heroblast/answers \
+  --title "我的知乎回答合集（按时间排序）" \
+  --separator "====="
+```
+
+合并后的文件会在命令行中打印路径，同时在文件头部标注合并来源目录与总篇数。
 
 ---
 
