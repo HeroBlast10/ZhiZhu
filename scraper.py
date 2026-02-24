@@ -846,6 +846,11 @@ async def save_content_as_markdown(
     """
     将提取到的内容保存为 Markdown 文件。
 
+    当 download_img=True 时（默认模式）：
+        输出结构为  <type_dir>/<日期_标题_作者>/index.md，图片存于 images/ 子目录。
+    当 download_img=False 时（--no-images 模式）：
+        输出结构为  <type_dir>/<日期_标题>.md，图片以 [图片] 占位符替代。
+
     Args:
         info: extract_answer 或 extract_article 返回的字典
         output_dir: 输出根目录
@@ -865,28 +870,37 @@ async def save_content_as_markdown(
     type_labels = {"answer": "回答", "article": "文章", "pin": "想法"}
     type_dirs = {"answer": "answers", "article": "articles", "pin": "pins"}
     type_label = type_labels.get(content_type, "内容")
-    folder_name = sanitize_filename(f"[{date}] {title} - {author}")
 
     # 按类型分目录
     type_dir = output_dir / type_dirs.get(content_type, "other")
-    folder = type_dir / folder_name
-    folder.mkdir(parents=True, exist_ok=True)
 
-    # 下载图片
-    img_map = {}
     if download_img:
+        # 普通模式：每篇内容一个子文件夹，图片存于 images/ 子目录
+        folder_name = sanitize_filename(f"[{date}] {title} - {author}")
+        folder = type_dir / folder_name
+        folder.mkdir(parents=True, exist_ok=True)
+
+        img_map = {}
         img_urls = ZhihuConverter.extract_image_urls(html)
         if img_urls:
             print(f"   🖼️  发现 {len(img_urls)} 张图片，正在下载...")
             img_dir = folder / "images"
             img_map = await download_images(img_urls, img_dir)
             print(f"   ✅ 成功下载 {len(img_map)} 张图片")
-            # 清理空目录
             if img_dir.exists() and not any(img_dir.iterdir()):
                 img_dir.rmdir()
 
+        converter = ZhihuConverter(img_map=img_map)
+        md_path = folder / "index.md"
+    else:
+        # --no-images 模式：所有文件直接放在 <type_dir>/ 中，以日期+标题命名
+        type_dir.mkdir(parents=True, exist_ok=True)
+        file_name = sanitize_filename(f"{date}_{title}") + ".md"
+        md_path = type_dir / file_name
+
+        converter = ZhihuConverter(no_images=True)
+
     # HTML → Markdown
-    converter = ZhihuConverter(img_map=img_map)
     md = converter.convert(html)
 
     # 拼接元信息头
@@ -898,8 +912,6 @@ async def save_content_as_markdown(
         f"> **日期**: {date}\n\n"
         f"---\n\n"
     )
-
-    md_path = folder / "index.md"
 
     # 拼接评论区
     comments_md = ""
@@ -914,17 +926,19 @@ async def save_content_as_markdown(
 def _scan_done_urls_from_disk(output_dir: Path) -> set[str]:
     """
     扫描输出目录中已存在的 Markdown 文件，从文件头部提取来源 URL。
-    这样即使 progress.json 丢失或不完整，已下载的内容也不会被重复爬取。
+    兼容两种结构：
+      - 普通模式（有图片）：<type_dir>/<子文件夹>/index.md
+      - --no-images 模式：<type_dir>/<日期_标题>.md（直接在类型目录中）
     """
     done = set()
     url_pattern = re.compile(r'>\s*\*\*来源\*\*:\s*\[([^\]]+)\]')
-    for subdir in ("answers", "articles"):
+    for subdir in ("answers", "articles", "pins"):
         type_dir = output_dir / subdir
         if not type_dir.exists():
             continue
-        for md_file in type_dir.rglob("index.md"):
+        # 兼容两种结构：递归匹配所有 .md 文件
+        for md_file in type_dir.rglob("*.md"):
             try:
-                # 只读前 500 字节即可，URL 在文件头部
                 text = md_file.read_text(encoding="utf-8")[:500]
                 m = url_pattern.search(text)
                 if m:

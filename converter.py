@@ -33,8 +33,9 @@ class ZhihuConverter:
     _INLINE_PH = f"IMATH{_PID}X"
     _BLOCK_PH = f"BMATH{_PID}X"
 
-    def __init__(self, img_map: dict[str, str] | None = None):
+    def __init__(self, img_map: dict[str, str] | None = None, no_images: bool = False):
         self._img_map = img_map or {}
+        self._no_images = no_images
         self._math_store: dict[str, str] = {}
         self._math_counter = 0
 
@@ -153,6 +154,7 @@ class ZhihuConverter:
         """调用 markdownify，使用自定义的图片处理逻辑。"""
         md_converter = _MarkdownBridge(
             img_map=self._img_map,
+            no_images=self._no_images,
             heading_style="atx",
             bullets="-",
             strip=["script", "style", "noscript"],
@@ -201,8 +203,14 @@ class ZhihuConverter:
 class _MarkdownBridge(MarkdownConverter):
     """继承 markdownify，仅覆盖图片标签的转换逻辑。"""
 
-    def __init__(self, img_map: dict[str, str] | None = None, **kwargs):
+    def __init__(
+        self,
+        img_map: dict[str, str] | None = None,
+        no_images: bool = False,
+        **kwargs,
+    ):
         self.img_map = img_map or {}
+        self.no_images = no_images
         super().__init__(**kwargs)
 
     def convert_img(self, el: Tag, text: str, parent_tags: set) -> str:
@@ -218,6 +226,8 @@ class _MarkdownBridge(MarkdownConverter):
             kw in src for kw in ["data:image", "noavatar"]
         ):
             return ""
+        if self.no_images:
+            return "[图片]\n\n"
         alt = el.get("alt", "")
         local = self.img_map.get(src, src)
         return f"![{alt}]({local})\n\n"
