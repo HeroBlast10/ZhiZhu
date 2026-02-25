@@ -2,8 +2,8 @@
 main.py — 知蛛 (ZhiZhu) 知乎内容爬虫入口
 
 使用方法:
-    # 启动终端交互界面（推荐新用户使用）
-    python tui.py
+    # 启动 Web 交互界面（推荐新用户使用，自动在浏览器中打开）
+    python webui.py
 
     # 登录知乎（首次使用需要）
     python main.py login
