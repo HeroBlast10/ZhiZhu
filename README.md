@@ -82,7 +82,26 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 2. 登录知乎
+### 2. 使用 Web 界面（推荐）
+
+如果你不熟悉命令行，可以直接使用自带的 Web 图形界面：
+
+```bash
+python webui.py
+```
+
+启动后会自动在浏览器中打开一个页面，包含多个标签页：
+
+- 登录知乎
+- 爬取用户回答 / 文章
+- 爬取用户想法（Pins）
+- 爬取问题下的回答
+- 爬取单个回答（可选附带评论）
+- 合并某个目录下的所有 Markdown 文件
+
+所有爬取进度和日志会实时显示在页面下方，你只需要填写参数并点击按钮即可。
+
+### 3. 登录知乎（命令行）
 
 首次使用需要登录，登录状态会持久化保存在 `browser_data/` 目录中。
 
@@ -92,7 +111,7 @@ python main.py login
 
 程序会打开浏览器窗口，请在浏览器中手动完成登录。登录成功后程序会自动检测并保存状态。
 
-### 3. 爬取用户内容
+### 4. 爬取用户内容（命令行）
 
 ```bash
 # 爬取某用户的所有回答和文章
@@ -106,7 +125,7 @@ https://www.zhihu.com/people/zhang-jia-wei
                              ^^^^^^^^^^^^^^ 这部分
 ```
 
-### 4. 爬取问题下的回答
+### 5. 爬取问题下的回答（命令行）
 
 ```bash
 # 爬取某个问题下的全部回答
@@ -119,7 +138,7 @@ python main.py question 12345
 python main.py question 12345 -n 20
 ```
 
-### 5. 爬取单个回答
+### 6. 爬取单个回答（命令行）
 
 ```bash
 # 爬取某个特定回答
@@ -129,14 +148,14 @@ python main.py answer https://www.zhihu.com/question/12345/answer/67890
 python main.py answer https://www.zhihu.com/question/12345/answer/67890 --with-comments
 ```
 
-### 6. 爬取用户想法
+### 7. 爬取用户想法（命令行）
 
 ```bash
 # 爬取某用户的所有想法
 python main.py pins zhang-jia-wei
 ```
 
-### 7. 通用选项
+### 8. 通用选项（命令行）
 
 以下选项适用于 `scrape`、`question`、`answer`、`pins` 所有命令：
 
