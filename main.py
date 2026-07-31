@@ -30,6 +30,28 @@ from scraper import login, scrape_user, scrape_question, scrape_single_answer, s
 from pathlib import Path
 
 
+def _positive_int(value: str) -> int:
+    """argparse 类型：严格正整数。"""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("必须是整数") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("必须大于 0")
+    return parsed
+
+
+def _nonnegative_float(value: str) -> float:
+    """argparse 类型：非负浮点数。"""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("必须是数字") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("不能为负数")
+    return parsed
+
+
 def _add_common_args(parser: argparse.ArgumentParser):
     """为子命令添加公共参数。"""
     parser.add_argument(
@@ -45,14 +67,14 @@ def _add_common_args(parser: argparse.ArgumentParser):
     )
     parser.add_argument(
         "--delay-min",
-        type=float,
-        default=5.0,
+        type=_nonnegative_float,
+        default=10.0,
         help="请求间最小延迟秒数（默认 10）",
     )
     parser.add_argument(
         "--delay-max",
-        type=float,
-        default=10.0,
+        type=_nonnegative_float,
+        default=20.0,
         help="请求间最大延迟秒数（默认 20）",
     )
     parser.add_argument(
@@ -100,7 +122,7 @@ def main():
     login_parser = subparsers.add_parser("login", help="登录知乎（手动登录，保存 Cookie）")
     login_parser.add_argument(
         "--timeout",
-        type=int,
+        type=_positive_int,
         default=300,
         help="等待登录的超时时间（秒），默认 300",
     )
@@ -112,12 +134,13 @@ def main():
         type=str,
         help="知乎用户的 URL token（个人主页 URL 中的标识符）",
     )
-    scrape_parser.add_argument(
+    content_group = scrape_parser.add_mutually_exclusive_group()
+    content_group.add_argument(
         "--only-answers",
         action="store_true",
         help="只爬取回答",
     )
-    scrape_parser.add_argument(
+    content_group.add_argument(
         "--only-articles",
         action="store_true",
         help="只爬取文章",
@@ -133,7 +156,7 @@ def main():
     )
     question_parser.add_argument(
         "-n", "--max-answers",
-        type=int,
+        type=_positive_int,
         default=None,
         help="最多爬取的回答数量（默认全部）",
     )

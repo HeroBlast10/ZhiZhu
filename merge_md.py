@@ -24,13 +24,13 @@ merge_md.py — 将 output 中某个文件夹的所有 .md 文件合并为一个
 
 import argparse
 import re
-import sys
+import uuid
 from pathlib import Path
 
 
 # ── 工具函数 ──────────────────────────────────────────────────
 
-def collect_md_files(root: Path) -> list[Path]:
+def collect_md_files(root: Path, exclude: Path | None = None) -> list[Path]:
     """
     从指定根目录中收集所有 .md 文件。
     支持两种结构：
@@ -38,7 +38,10 @@ def collect_md_files(root: Path) -> list[Path]:
       - <root>/<文件>.md
     """
     files: list[Path] = []
+    excluded = exclude.resolve() if exclude else None
     for path in root.rglob("*.md"):
+        if excluded is not None and path.resolve() == excluded:
+            continue
         files.append(path)
     return files
 
@@ -59,7 +62,7 @@ def sort_key_by_date(path: Path) -> tuple[str, str]:
         text = path.read_text(encoding="utf-8")
     except Exception:
         text = ""
-    date = extract_date_from_header(text)
+    date = extract_date_from_header(text) or "9999-99-99"
     return (date, str(path))
 
 
@@ -88,13 +91,13 @@ def merge(
         title: 合并文件的总标题（为空则自动生成）
     """
     if not source_dir.exists():
-        print(f"[ERR] 目录不存在: {source_dir}", file=sys.stderr)
-        sys.exit(1)
+        raise FileNotFoundError(f"目录不存在: {source_dir}")
+    if not source_dir.is_dir():
+        raise NotADirectoryError(f"来源路径不是目录: {source_dir}")
 
-    files = collect_md_files(source_dir)
+    files = collect_md_files(source_dir, exclude=output_file)
     if not files:
-        print(f"[WARN] 目录中未找到任何 .md 文件: {source_dir}", file=sys.stderr)
-        sys.exit(1)
+        raise ValueError(f"目录中未找到任何可合并的 .md 文件: {source_dir}")
 
     # 排序
     if sort_by == "date":
@@ -107,34 +110,41 @@ def merge(
         title = f"{source_dir.resolve().name} — 合并文档"
 
     # 构建合并内容
-    parts: list[str] = [f"# {title}\n\n"]
-    parts.append(
-        f"> 共 {len(files)} 篇，来源目录：`{source_dir.resolve()}`\n\n"
-    )
-    parts.append(f"{separator}\n\n")
-
-    sep_block = f"\n\n{separator}\n\n"
-
-    for i, md_file in enumerate(files):
+    contents: list[str] = []
+    for md_file in files:
         try:
             content = md_file.read_text(encoding="utf-8").strip()
         except Exception as e:
-            print(f"[WARN] 读取失败，已跳过: {md_file}  ({e})", file=sys.stderr)
+            print(f"[WARN] 读取失败，已跳过: {md_file}  ({e})")
             continue
+        if content:
+            contents.append(content)
 
-        # 把每个文件的内容追加进去
-        parts.append(content)
+    if not contents:
+        raise ValueError(f"目录中的 Markdown 文件均为空或无法读取: {source_dir}")
 
-        if i < len(files) - 1:
-            parts.append(sep_block)
+    parts: list[str] = [f"# {title}\n\n"]
+    parts.append(
+        f"> 共 {len(contents)} 篇，来源目录：`{source_dir.resolve()}`\n\n"
+    )
+    parts.append(f"{separator}\n\n")
+    parts.append(f"\n\n{separator}\n\n".join(contents))
 
     merged = "".join(parts) + "\n"
 
     # 确保输出目录存在
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_text(merged, encoding="utf-8")
+    temp_file = output_file.with_name(
+        f".{output_file.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        temp_file.write_text(merged, encoding="utf-8")
+        temp_file.replace(output_file)
+    finally:
+        if temp_file.exists():
+            temp_file.unlink()
 
-    print(f"[OK] 合并完成：共 {len(files)} 个文件 -> {output_file.resolve()}")
+    print(f"[OK] 合并完成：共 {len(contents)} 个文件 -> {output_file.resolve()}")
 
 
 # ── 命令行入口 ────────────────────────────────────────────────

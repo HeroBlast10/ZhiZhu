@@ -23,10 +23,21 @@ import asyncio
 import queue
 import sys
 import threading
+from collections import deque
 from pathlib import Path
 from typing import Generator
 
 import gradio as gr
+
+
+_TASK_LOCK = threading.Lock()
+_MAX_LOG_LINES = 2000
+_GRADIO_CONCURRENCY_ID = "zhizhu-browser-task"
+_APP_CSS = """
+#header { text-align: center; margin-bottom: 8px; }
+#header h1 { font-size: 2em; }
+#header p  { color: #888; margin-top: 0; }
+"""
 
 
 # ── stdout 重定向 ──────────────────────────────────────────────
@@ -50,20 +61,28 @@ class _QueueWriter:
             self._buf = ""
 
     def fileno(self) -> int:
-        return sys.__stdout__.fileno()
+        return sys.__stdout__.fileno() if sys.__stdout__ is not None else -1
 
 
 def _run_in_thread(fn, q: queue.Queue) -> None:
     """在子线程中执行 fn()，完成后向队列推送 None（结束信号）。"""
-    old_stdout = sys.stdout
-    sys.stdout = _QueueWriter(q)  # type: ignore[assignment]
+    writer = _QueueWriter(q)
+    if _TASK_LOCK.locked():
+        q.put("另一个任务正在运行，当前任务已排队等待。")
+
     try:
-        fn()
-    except Exception as e:
-        sys.stdout.write(f"\n[ERROR] {e}\n")  # type: ignore[union-attr]
+        # sys.stdout 和 browser_data 都是进程级共享资源，必须串行访问。
+        with _TASK_LOCK:
+            old_stdout = sys.stdout
+            sys.stdout = writer  # type: ignore[assignment]
+            try:
+                fn()
+            except Exception as e:
+                writer.write(f"\n[ERROR] {e}\n")
+            finally:
+                writer.flush()
+                sys.stdout = old_stdout
     finally:
-        sys.stdout.flush()  # type: ignore[union-attr]
-        sys.stdout = old_stdout
         q.put(None)  # 结束信号
 
 
@@ -75,13 +94,26 @@ def _stream_logs(fn) -> Generator[str, None, None]:
     q: queue.Queue = queue.Queue()
     t = threading.Thread(target=_run_in_thread, args=(fn, q), daemon=True)
     t.start()
-    log_lines: list[str] = []
+    log_lines: deque[str] = deque(maxlen=_MAX_LOG_LINES)
+    finished = False
     while True:
         item = q.get()
         if item is None:
             break
         log_lines.append(item)
+        # 合并当前已经到达的日志，减少向前端重复传输整个文本的次数。
+        while True:
+            try:
+                pending = q.get_nowait()
+            except queue.Empty:
+                break
+            if pending is None:
+                finished = True
+                break
+            log_lines.append(pending)
         yield "\n".join(log_lines)
+        if finished:
+            break
     t.join()
     yield "\n".join(log_lines)
 
@@ -89,7 +121,7 @@ def _stream_logs(fn) -> Generator[str, None, None]:
 # ── 辅助：解析输出目录 ─────────────────────────────────────────
 
 def _parse_output(val: str) -> Path | None:
-    val = val.strip()
+    val = (val or "").strip()
     return Path(val) if val else None
 
 
@@ -109,7 +141,13 @@ def login_tab() -> None:
     def run(t):
         yield from _stream_logs(lambda: _login_fn(t))
 
-    btn.click(fn=run, inputs=[timeout], outputs=[log])
+    btn.click(
+        fn=run,
+        inputs=[timeout],
+        outputs=[log],
+        concurrency_id=_GRADIO_CONCURRENCY_ID,
+        concurrency_limit=1,
+    )
 
 
 # ── 爬取用户 ──────────────────────────────────────────────────
@@ -148,9 +186,18 @@ def scrape_user_tab() -> None:
         if not tok.strip():
             yield "请先填写用户 URL Token"
             return
+        if not da and not dart:
+            yield "请至少选择“爬取回答”或“爬取文章”中的一项"
+            return
         yield from _stream_logs(lambda: _scrape_user_fn(tok, da, dart, ni, dmin, dmax, hl, od))
 
-    btn.click(fn=run, inputs=[token, do_answers, do_articles, no_images, delay_min, delay_max, headless, out_dir], outputs=[log])
+    btn.click(
+        fn=run,
+        inputs=[token, do_answers, do_articles, no_images, delay_min, delay_max, headless, out_dir],
+        outputs=[log],
+        concurrency_id=_GRADIO_CONCURRENCY_ID,
+        concurrency_limit=1,
+    )
 
 
 # ── 爬取用户想法 ───────────────────────────────────────────────
@@ -187,14 +234,28 @@ def scrape_pins_tab() -> None:
             return
         yield from _stream_logs(lambda: _scrape_pins_fn(tok, ni, dmin, dmax, hl, od))
 
-    btn.click(fn=run, inputs=[token, no_images, delay_min, delay_max, headless, out_dir], outputs=[log])
+    btn.click(
+        fn=run,
+        inputs=[token, no_images, delay_min, delay_max, headless, out_dir],
+        outputs=[log],
+        concurrency_id=_GRADIO_CONCURRENCY_ID,
+        concurrency_limit=1,
+    )
 
 
 # ── 爬取问题 ──────────────────────────────────────────────────
 
 def _scrape_question_fn(question_input, max_answers, no_images, delay_min, delay_max, headless, out_dir):
     from scraper import scrape_question
-    max_n = int(max_answers) if str(max_answers).strip().isdigit() else None
+    raw_max = str(max_answers or "").strip()
+    max_n = None
+    if raw_max:
+        try:
+            max_n = int(raw_max)
+        except ValueError as exc:
+            raise ValueError("最大回答数必须是正整数") from exc
+        if max_n <= 0:
+            raise ValueError("最大回答数必须是正整数")
     asyncio.run(scrape_question(
         question_input=question_input.strip(),
         max_answers=max_n,
@@ -230,7 +291,13 @@ def scrape_question_tab() -> None:
             return
         yield from _stream_logs(lambda: _scrape_question_fn(qi, ma, ni, dmin, dmax, hl, od))
 
-    btn.click(fn=run, inputs=[question_input, max_answers, no_images, delay_min, delay_max, headless, out_dir], outputs=[log])
+    btn.click(
+        fn=run,
+        inputs=[question_input, max_answers, no_images, delay_min, delay_max, headless, out_dir],
+        outputs=[log],
+        concurrency_id=_GRADIO_CONCURRENCY_ID,
+        concurrency_limit=1,
+    )
 
 
 # ── 爬取单个回答 ───────────────────────────────────────────────
@@ -272,7 +339,13 @@ def scrape_answer_tab() -> None:
             return
         yield from _stream_logs(lambda: _scrape_answer_fn(url, wc, ni, dmin, dmax, hl, od))
 
-    btn.click(fn=run, inputs=[answer_url, with_comments, no_images, delay_min, delay_max, headless, out_dir], outputs=[log])
+    btn.click(
+        fn=run,
+        inputs=[answer_url, with_comments, no_images, delay_min, delay_max, headless, out_dir],
+        outputs=[log],
+        concurrency_id=_GRADIO_CONCURRENCY_ID,
+        concurrency_limit=1,
+    )
 
 
 # ── 合并文档 ──────────────────────────────────────────────────
@@ -318,21 +391,19 @@ def merge_tab() -> None:
             return
         yield from _stream_logs(lambda: _merge_fn(sd, of, sb, sep, t))
 
-    btn.click(fn=run, inputs=[source_dir, output_file, sort_by, separator, title], outputs=[log])
+    btn.click(
+        fn=run,
+        inputs=[source_dir, output_file, sort_by, separator, title],
+        outputs=[log],
+        concurrency_id=_GRADIO_CONCURRENCY_ID,
+        concurrency_limit=1,
+    )
 
 
 # ── 主界面 ────────────────────────────────────────────────────
 
 def build_app() -> gr.Blocks:
-    with gr.Blocks(
-        title="ZhiZhu 知蛛 — 知乎内容爬虫",
-        theme=gr.themes.Soft(),
-        css="""
-        #header { text-align: center; margin-bottom: 8px; }
-        #header h1 { font-size: 2em; }
-        #header p  { color: #888; margin-top: 0; }
-        """,
-    ) as app:
+    with gr.Blocks(title="ZhiZhu 知蛛 — 知乎内容爬虫") as app:
         with gr.Column(elem_id="header"):
             gr.Markdown(
                 "# ZhiZhu 知蛛\n"
@@ -366,4 +437,6 @@ if __name__ == "__main__":
         server_port=7860,
         inbrowser=True,
         share=False,
+        theme=gr.themes.Soft(),
+        css=_APP_CSS,
     )

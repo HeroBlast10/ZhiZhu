@@ -10,9 +10,21 @@ converter.py — HTML → Markdown 转换模块
 
 import re
 import uuid
+from urllib.parse import urlparse, urlunparse
 
 from bs4 import BeautifulSoup, Tag
 from markdownify import MarkdownConverter
+
+
+def normalize_image_url(url: str) -> str:
+    """规范化图片 URL，确保下载映射和 Markdown 重写使用同一个键。"""
+    url = (url or "").strip()
+    if url.startswith("//"):
+        url = f"https:{url}"
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return url
+    return urlunparse(parsed._replace(fragment=""))
 
 
 class ZhihuConverter:
@@ -74,7 +86,9 @@ class ZhihuConverter:
             )
             if not src or src.startswith("data:") or "noavatar" in src:
                 continue
-            urls.append(src)
+            normalized = normalize_image_url(src)
+            if normalized:
+                urls.append(normalized)
 
         return list(dict.fromkeys(urls))  # 去重保序
 
@@ -222,6 +236,7 @@ class _MarkdownBridge(MarkdownConverter):
         )
         if not src:
             return ""
+        src = normalize_image_url(src)
         if "zhihu.com/equation" not in src and any(
             kw in src for kw in ["data:image", "noavatar"]
         ):
