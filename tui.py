@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import sys
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -49,19 +48,23 @@ class _TUIWriter:
         self._log = log
         self._buf = ""
 
+    def _emit(self, line: str) -> None:
+        """Textual 控件只能通过主线程更新。"""
+        self._log.app.call_from_thread(self._log.write, line)
+
     def write(self, text: str) -> None:
         self._buf += text
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
-            self._log.write(line)
+            self._emit(line)
 
     def flush(self) -> None:
         if self._buf:
-            self._log.write(self._buf)
+            self._emit(self._buf)
             self._buf = ""
 
     def fileno(self) -> int:
-        return sys.__stdout__.fileno()
+        return sys.__stdout__.fileno() if sys.__stdout__ is not None else -1
 
 
 # ── 面板基类 ───────────────────────────────────────────────────
@@ -141,13 +144,19 @@ class _Panel(ScrollableContainer):
         if self.query("#delay_min"):
             try:
                 params["delay_min"] = float(self.query_one("#delay_min", Input).value or 10)
-            except ValueError:
-                params["delay_min"] = 10.0
+            except ValueError as exc:
+                raise ValueError("最小延迟必须是数字") from exc
         if self.query("#delay_max"):
             try:
                 params["delay_max"] = float(self.query_one("#delay_max", Input).value or 20)
-            except ValueError:
-                params["delay_max"] = 20.0
+            except ValueError as exc:
+                raise ValueError("最大延迟必须是数字") from exc
+        delay_min = params.get("delay_min", 10.0)
+        delay_max = params.get("delay_max", 20.0)
+        if delay_min < 0 or delay_max < 0:
+            raise ValueError("请求延迟不能为负数")
+        if delay_min > delay_max:
+            raise ValueError("最小延迟不能大于最大延迟")
         if self.query("#headless"):
             try:
                 params["headless"] = self.query_one("#headless", Checkbox).value
@@ -176,8 +185,10 @@ class LoginPanel(_Panel):
     def collect_params(self) -> dict[str, Any]:
         try:
             timeout = int(self.query_one("#timeout", Input).value or 300)
-        except ValueError:
-            timeout = 300
+        except ValueError as exc:
+            raise ValueError("登录超时时间必须是正整数") from exc
+        if timeout <= 0:
+            raise ValueError("登录超时时间必须是正整数")
         return {"timeout": timeout}
 
 
@@ -205,6 +216,8 @@ class ScrapeUserPanel(_Panel):
         params["user_url_token"] = token
         params["scrape_answers"] = self.query_one("#scrape_answers", Checkbox).value
         params["scrape_articles"] = self.query_one("#scrape_articles", Checkbox).value
+        if not params["scrape_answers"] and not params["scrape_articles"]:
+            raise ValueError("至少选择回答或文章中的一种")
         return params
 
 
@@ -252,7 +265,16 @@ class ScrapeQuestionPanel(_Panel):
         params = self._get_common()
         params["question_input"] = q
         raw = self.query_one("#max_answers", Input).value.strip()
-        params["max_answers"] = int(raw) if raw.isdigit() else None
+        if raw:
+            try:
+                max_answers = int(raw)
+            except ValueError as exc:
+                raise ValueError("最大回答数必须是正整数") from exc
+            if max_answers <= 0:
+                raise ValueError("最大回答数必须是正整数")
+            params["max_answers"] = max_answers
+        else:
+            params["max_answers"] = None
         return params
 
 

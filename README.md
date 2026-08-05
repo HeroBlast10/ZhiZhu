@@ -8,7 +8,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)](#系统要求)
 [![Playwright](https://img.shields.io/badge/Playwright-Chromium-green?logo=google-chrome&logoColor=white)](#安装)
-[![License](https://img.shields.io/badge/License-MIT-yellow)](#免责声明)
+[![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
 </div>
 
@@ -54,7 +54,7 @@
 | **问题级爬取** | 爬取指定问题下的全部或前 N 个回答 |
 | **单回答爬取** | 精准爬取某个特定回答，可选附带完整评论区 |
 | **评论区提取** | 通过知乎 API 获取全部根评论与子评论，格式化为 Markdown |
-| **浏览器指纹伪装** | 内置 WebGL、Canvas、AudioContext 等多维度反检测机制 |
+| **浏览器兼容策略** | 保持原生浏览器 API 与指纹字段自洽，避免破坏页面功能 |
 | **智能延迟策略** | 请求间随机等待 10-20 秒（可自定义），以时间换安全 |
 | **断点续传** | 自动记录进度，中断后重新运行即从上次位置继续 |
 | **LaTeX 公式还原** | 完美转换知乎数学公式为标准 `$...$` / `$$...$$` 语法 |
@@ -100,6 +100,16 @@ python webui.py
 - 合并某个目录下的所有 Markdown 文件
 
 所有爬取进度和日志会实时显示在页面下方，你只需要填写参数并点击按钮即可。
+
+### 可选：终端交互界面
+
+如果偏好终端操作，也可以启动 Textual TUI：
+
+```bash
+python tui.py
+```
+
+Web UI 和 TUI 都会限制同一进程只运行一个浏览器任务，避免登录目录和日志互相冲突。
 
 ### 3. 登录知乎（命令行）
 
@@ -193,23 +203,23 @@ output/
     ├── links.json              # 所有链接列表
     ├── progress.json           # 爬取进度（用于断点续传）
     ├── answers/                # 回答
-    │   ├── [2024-01-01] 问题标题 - 作者/
+    │   ├── [2024-01-01] 问题标题 - 作者__answer_回答ID/
     │   │   ├── index.md        # Markdown 内容
     │   │   └── images/         # 本地化图片
     │   └── ...
     ├── articles/               # 文章
-    │   ├── [2024-02-01] 文章标题 - 作者/
+    │   ├── [2024-02-01] 文章标题 - 作者__article_文章ID/
     │   │   ├── index.md
     │   │   └── images/
     │   └── ...
     └── pins/                   # 想法
-        ├── [2024-03-01] 想法内容前50字 - 作者/
+        ├── [2024-03-01] 想法内容前50字 - 作者__pin_想法ID/
         │   ├── index.md
         │   └── images/
         └── ...
 ```
 
-如果使用 `--no-images`（纯文本模式），则不再为每篇内容创建子文件夹，所有 Markdown 文件会直接放在类型目录下，文件名为 `日期_标题.md`，且文中图片使用占位符 `[图片]` 表示，不包含本地图片路径：
+如果使用 `--no-images`（纯文本模式），则不再为每篇内容创建子文件夹，所有 Markdown 文件会直接放在类型目录下。文件名始终附带内容类型和稳定 ID，避免同日、同标题或长标题截断时互相覆盖。文中图片使用占位符 `[图片]` 表示：
 
 ```text
 output/
@@ -217,14 +227,14 @@ output/
     ├── links.json
     ├── progress.json
     ├── answers/
-    │   ├── 2025-02-10_如何看待猫眼预测《哪吒 2》票房最终将达到 120 亿？.md
-    │   ├── 2025-04-05_在你所知道的历史或体育赛事中，“Speed” 在 4 月 4 日的那次表现有什么特别之处？.md
+    │   ├── [2025-02-10] 如何看待猫眼预测《哪吒 2》票房最终将达到 120 亿？__answer_12345.md
+    │   ├── [2025-04-05] 历史或体育赛事示例__answer_67890.md
     │   └── ...
     ├── articles/
-    │   ├── 2024-02-01_文章标题示例.md
+    │   ├── [2024-02-01] 文章标题示例__article_24680.md
     │   └── ...
     └── pins/
-        ├── 2024-03-01_想法内容前50字示例.md
+        ├── [2024-03-01] 想法内容前50字示例__pin_13579.md
         └── ...
 ```
 
@@ -236,6 +246,8 @@ output/
 # 程序会自动检测 progress.json，跳过已完成的内容
 python main.py scrape zhang-jia-wei
 ```
+
+进度文件采用 URL → Markdown 路径映射。启动时会重新核验实际文件；如果用户手动删除了某篇 Markdown，对应的失效进度会自动移除并重新下载。Markdown、链接列表和进度文件均采用同目录临时文件原子替换，降低中断造成文件损坏的风险。
 
 ---
 
@@ -263,6 +275,20 @@ python merge_md.py output/heroblast/answers \
 
 合并后的文件会在命令行中打印路径，同时在文件头部标注合并来源目录与总篇数。
 
+即使把输出文件放在来源目录中，合并器也会自动排除该输出文件，重复运行不会把上次结果再次合并进去。
+
+---
+
+## 开发与测试
+
+```bash
+pip install -r requirements-dev.txt
+python -m unittest discover -v
+mypy
+```
+
+测试覆盖文件名冲突、断点校验、Markdown 转换、合并器重复运行、评论错误处理、Web UI 并发和浏览器 API 一致性。
+
 ---
 
 ## 注意事项
@@ -271,6 +297,7 @@ python merge_md.py output/heroblast/answers \
 - **登录状态** — 建议在登录状态下爬取，可获取完整内容
 - **反爬触发** — 如果触发知乎反爬机制，程序会自动增加额外等待时间
 - **大量内容** — 如果用户有数百个回答，爬取可能需要较长时间，请耐心等待
+- **登录数据** — `browser_data/` 含持久登录状态，已被 Git 忽略；不要把它复制到公开目录或发送给他人
 
 ## 免责声明
 

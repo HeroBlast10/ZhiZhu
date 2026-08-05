@@ -8,61 +8,229 @@ scraper.py — 知乎内容爬虫核心模块
 4. 爬取指定问题下的所有（或前 N 个）回答
 5. 爬取单个回答，可选附带评论区
 6. 逐个访问并提取内容，转为 Markdown 保存
-7. 内置反检测（stealth JS 注入、指纹伪装）
+7. 保守的自动化兼容处理，不篡改原生浏览器指纹 API
 8. 请求间隔随机延迟，降低被封风险
 """
 
 import asyncio
+import builtins
 import hashlib
+import ipaddress
 import json
 import random
 import re
+import sys
 import time
-from datetime import date as dt_date, datetime
+import uuid
+from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 from playwright.async_api import async_playwright, Page, BrowserContext
 
 from stealth import STEALTH_JS
-from converter import ZhihuConverter
+from converter import ZhihuConverter, normalize_image_url
 
 # ── 配置 ─────────────────────────────────────────────────────
 
 USER_DATA_DIR = Path(__file__).parent / "browser_data"
 DEFAULT_OUTPUT_DIR = Path(__file__).parent / "output"
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/128.0.0.0 Safari/537.36"
-)
-
 IMG_HEADERS = {
     "Referer": "https://www.zhihu.com/",
-    "User-Agent": USER_AGENT,
 }
 
 # 每次请求之间的延迟范围（秒）
-MIN_DELAY = 5
-MAX_DELAY = 10
+MIN_DELAY: float = 10.0
+MAX_DELAY: float = 20.0
+
+MAX_IMAGE_BYTES = 25 * 1024 * 1024
+MAX_IMAGE_CONCURRENCY = 5
+ALLOWED_IMAGE_SCHEMES = {"http", "https"}
+MAX_FILENAME_COMPONENT_CHARS = 120
+# Linux 等文件系统通常以 UTF-8 字节数限制单个路径组件；预留少量余量。
+MAX_FILENAME_COMPONENT_BYTES = 240
+
+
+class ScraperError(RuntimeError):
+    """爬取流程的基础异常。"""
+
+
+class AntiBotError(ScraperError):
+    """页面触发登录、验证码或反爬限制。"""
+
+
+class ContentExtractionError(ScraperError):
+    """目标页面存在，但没有提取到可信正文。"""
+
+
+class CommentFetchError(ScraperError):
+    """评论 API 请求失败或返回了不完整分页数据。"""
+
+
+def _safe_print(*values, **kwargs) -> None:
+    """在 GBK 等不支持 emoji 的终端中降级字符，避免日志导致任务崩溃。"""
+    output = kwargs.get("file") or sys.stdout
+    encoding = getattr(output, "encoding", None)
+    if encoding:
+        replacements = {
+            "⚠️": "[WARN]",
+            "✅": "[OK]",
+            "❌": "[ERROR]",
+            "⏳": "[WAIT]",
+            "⏭️": "[SKIP]",
+            "✨": "[DONE]",
+            "🔐": "[LOGIN]",
+            "🌍": "[GET]",
+            "📜": "[SCROLL]",
+            "📋": "[INFO]",
+            "📝": "[LIST]",
+            "🚀": "[START]",
+            "📌": "[RESUME]",
+            "📥": "[FETCH]",
+            "💾": "[SAVE]",
+            "📚": "[TASK]",
+            "🖼️": "[IMAGE]",
+            "💬": "[COMMENT]",
+            "📂": "[DISK]",
+        }
+
+        def make_encodable(value: object) -> str:
+            text = str(value)
+            for symbol, replacement in replacements.items():
+                text = text.replace(symbol, replacement)
+            return text.encode(encoding, errors="replace").decode(encoding)
+
+        values = tuple(
+            make_encodable(value)
+            for value in values
+        )
+    builtins.print(*values, **kwargs)
+
+
+print = _safe_print
 
 
 # ── 工具函数 ──────────────────────────────────────────────────
+
+def _truncate_filename_component(
+    value: str,
+    *,
+    max_chars: int = MAX_FILENAME_COMPONENT_CHARS,
+    max_bytes: int = MAX_FILENAME_COMPONENT_BYTES,
+) -> str:
+    """按字符数和 UTF-8 字节数截断单个路径组件。"""
+    value = value[:max_chars]
+    if len(value.encode("utf-8")) > max_bytes:
+        value = value.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+    return value.rstrip(" .")
 
 def sanitize_filename(name: str) -> str:
     """清理文件名中不允许的字符。"""
     name = re.sub(r'[/\\:*?"<>|\x00-\x1f]', "_", name)
     name = name.strip(" .")
-    if len(name) > 120:
-        name = name[:120].rstrip(" .")
-    return name or "untitled"
+    name = _truncate_filename_component(name)
+    name = name or "untitled"
+
+    # Windows 保留设备名即使带扩展名也不可作为普通文件名。
+    reserved = {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+    if name.split(".", 1)[0].upper() in reserved:
+        name = f"_{name}"
+    return name
 
 
-def random_delay():
+def random_delay(delay_min: float = MIN_DELAY, delay_max: float = MAX_DELAY) -> float:
     """返回一个随机延迟时间。"""
-    return MIN_DELAY + random.random() * (MAX_DELAY - MIN_DELAY)
+    _validate_delay_range(delay_min, delay_max)
+    return random.uniform(delay_min, delay_max)
+
+
+def _validate_delay_range(delay_min: float, delay_max: float) -> None:
+    """验证请求延迟范围。"""
+    if delay_min < 0 or delay_max < 0:
+        raise ValueError("请求延迟不能为负数")
+    if delay_min > delay_max:
+        raise ValueError("最小延迟不能大于最大延迟")
+
+
+def _content_identifier(url: str, content_type: str) -> str:
+    """从 URL 提取稳定内容 ID，无法提取时使用 URL 哈希。"""
+    patterns = {
+        "answer": r"/answer/(\d+)",
+        "article": r"/p/(\d+)",
+        "pin": r"/pin/(\d+)",
+    }
+    match = re.search(patterns.get(content_type, r"/(\d+)(?:/)?$"), urlparse(url).path)
+    if match:
+        return match.group(1)
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+
+
+def _content_path_stem(
+    *,
+    date: str,
+    title: str,
+    author: str,
+    url: str,
+    content_type: str,
+    include_author: bool,
+) -> str:
+    """生成不会因截断丢失内容 ID 的稳定文件名。"""
+    identifier = sanitize_filename(_content_identifier(url, content_type))
+    suffix = f"__{content_type}_{identifier}"
+    display = f"[{date}] {title}"
+    if include_author:
+        display += f" - {author}"
+    display = sanitize_filename(display)
+    char_budget = max(1, MAX_FILENAME_COMPONENT_CHARS - len(suffix))
+    byte_budget = max(
+        1,
+        MAX_FILENAME_COMPONENT_BYTES - len(suffix.encode("utf-8")),
+    )
+    display = _truncate_filename_component(
+        display,
+        max_chars=char_budget,
+        max_bytes=byte_budget,
+    ).rstrip("_") or "untitled"
+    return f"{display}{suffix}"
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """在同目录先写临时文件，再原子替换目标文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 临时名不拼接目标名，避免长标题在 Linux 上超过单个路径组件的字节上限。
+    temp_path = path.with_name(f".tmp-{uuid.uuid4().hex}")
+    try:
+        temp_path.write_text(content, encoding="utf-8")
+        temp_path.replace(path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _atomic_write_json(path: Path, payload: object, *, indent: int | None = None) -> None:
+    """原子写入 JSON，避免中断时留下半个进度文件。"""
+    _atomic_write_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=indent, sort_keys=True),
+    )
+
+
+def _normalize_zhihu_url(href: str, base_url: str = "https://www.zhihu.com/") -> str | None:
+    """规范化知乎链接并拒绝外部主机。"""
+    full_url = urljoin(base_url, href)
+    parsed = urlparse(full_url)
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if hostname != "zhihu.com" and not hostname.endswith(".zhihu.com"):
+        return None
+    return urlunparse(parsed._replace(query="", fragment=""))
 
 
 def _nested_get(d: dict, *keys):
@@ -104,7 +272,7 @@ def parse_answer_url(input_str: str) -> tuple[str, str, str]:
 # ── 浏览器上下文管理 ─────────────────────────────────────────
 
 async def create_browser_context(pw, headless=False) -> BrowserContext:
-    """创建带有反检测的持久化浏览器上下文。"""
+    """创建保持原生浏览器 API 自洽的持久化上下文。"""
     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     width = 1920 + random.randint(-100, 100)
@@ -114,9 +282,6 @@ async def create_browser_context(pw, headless=False) -> BrowserContext:
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-blink-features=AutomationControlled",
-        "--disable-features=IsolateOrigins,site-per-process",
-        "--disable-site-isolation-trials",
-        "--disable-infobars",
         f"--window-size={width},{height}",
     ]
 
@@ -126,13 +291,12 @@ async def create_browser_context(pw, headless=False) -> BrowserContext:
         slow_mo=50,
         args=launch_args,
         viewport={"width": width, "height": height},
-        user_agent=USER_AGENT,
         locale="zh-CN",
         timezone_id="Asia/Shanghai",
         java_script_enabled=True,
     )
 
-    # 注入反检测脚本
+    # 仅隐藏 webdriver 标记，不伪造或破坏原生浏览器 API
     await context.add_init_script(STEALTH_JS)
 
     return context
@@ -148,6 +312,9 @@ async def login(timeout: int = 300):
     Args:
         timeout: 等待登录的超时时间（秒），默认 300 秒
     """
+    if timeout <= 0:
+        raise ValueError("登录超时时间必须大于 0 秒")
+
     print("=" * 60)
     print("🔐 知乎登录")
     print("=" * 60)
@@ -206,7 +373,8 @@ async def _scroll_and_collect_links(
     # 关闭可能的登录弹窗
     await _dismiss_popup(page)
 
-    collected_links = set()
+    collected_links: list[str] = []
+    seen_links: set[str] = set()
     no_new_count = 0
     max_no_new = 10  # 连续 10 次滚动没有新链接则认为到底了
 
@@ -220,18 +388,15 @@ async def _scroll_and_collect_links(
         for el in link_elements:
             href = await el.get_attribute("href")
             if href:
-                # 处理不同格式的 URL
-                if href.startswith("//"):
-                    href = "https:" + href
-                elif href.startswith("/"):
-                    href = "https://www.zhihu.com" + href
-                elif not href.startswith("http"):
-                    href = "https://www.zhihu.com/" + href
-                if any(kw in href for kw in url_filter_keywords):
-                    links.append(href.split("?")[0])
+                normalized = _normalize_zhihu_url(href, base_url)
+                if normalized and any(kw in normalized for kw in url_filter_keywords):
+                    links.append(normalized)
 
         prev_count = len(collected_links)
-        collected_links.update(links)
+        for link in links:
+            if link not in seen_links:
+                seen_links.add(link)
+                collected_links.append(link)
 
         new_count = len(collected_links) - prev_count
         if new_count == 0:
@@ -279,7 +444,7 @@ async def _scroll_and_collect_links(
         if new_count == 0:
             await asyncio.sleep(2.0)
 
-    return sorted(collected_links)
+    return collected_links
 
 
 async def collect_user_answers(page: Page, user_url_token: str) -> list[str]:
@@ -327,7 +492,8 @@ async def collect_question_answer_links(
     # 关闭可能的登录弹窗
     await _dismiss_popup(page)
 
-    collected_links = set()
+    collected_links: list[str] = []
+    seen_links: set[str] = set()
     no_new_count = 0
     max_no_new = 10
     scroll_count = 0
@@ -340,17 +506,15 @@ async def collect_question_answer_links(
         for el in link_elements:
             href = await el.get_attribute("href")
             if href:
-                if href.startswith("//"):
-                    href = "https:" + href
-                elif href.startswith("/"):
-                    href = "https://www.zhihu.com" + href
-                elif not href.startswith("http"):
-                    href = "https://www.zhihu.com/" + href
-                if f"/question/{question_id}/answer/" in href:
-                    links.append(href.split("?")[0])
+                normalized = _normalize_zhihu_url(href, url)
+                if normalized and f"/question/{question_id}/answer/" in normalized:
+                    links.append(normalized)
 
         prev_count = len(collected_links)
-        collected_links.update(links)
+        for link in links:
+            if link not in seen_links:
+                seen_links.add(link)
+                collected_links.append(link)
         new_count = len(collected_links) - prev_count
 
         if new_count == 0:
@@ -363,7 +527,7 @@ async def collect_question_answer_links(
               + (f"（新增 {new_count}）" if new_count > 0 else "（无新增）"))
 
         # 检查是否已达到目标数量
-        if max_answers and len(collected_links) >= max_answers:
+        if max_answers is not None and len(collected_links) >= max_answers:
             print(f"   📋 已达到目标数量 {max_answers}。")
             break
 
@@ -398,8 +562,8 @@ async def collect_question_answer_links(
         if new_count == 0:
             await asyncio.sleep(2.0)
 
-    result = sorted(collected_links)
-    if max_answers:
+    result = collected_links
+    if max_answers is not None:
         result = result[:max_answers]
     return result
 
@@ -415,6 +579,53 @@ async def _dismiss_popup(page: Page) -> None:
             await page.wait_for_timeout(500)
     except Exception:
         pass
+
+
+async def _assert_page_usable(page: Page, expected_url: str) -> None:
+    """拒绝登录页、验证页、错误页和意外的站外跳转。"""
+    parsed = urlparse(page.url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname != "zhihu.com" and not hostname.endswith(".zhihu.com"):
+        raise ContentExtractionError(
+            f"页面被重定向到非知乎地址: {page.url}（原地址: {expected_url}）"
+        )
+    if "/signin" in parsed.path or "/signup" in parsed.path:
+        raise AntiBotError(f"登录状态已失效，请重新登录: {expected_url}")
+
+    body_text = await page.locator("body").inner_text(timeout=10000)
+    anti_bot_markers = (
+        "40362",
+        "请求存在异常",
+        "请完成安全验证",
+        "帐号或密码错误",
+        "系统检测到您的网络环境存在异常",
+    )
+    marker = next((item for item in anti_bot_markers if item in body_text), None)
+    if marker:
+        raise AntiBotError(f"触发知乎验证或反爬（{marker}）: {expected_url}")
+
+
+async def _first_nonempty_html(
+    page: Page,
+    selectors: tuple[str, ...],
+    *,
+    content_kind: str,
+    url: str,
+) -> str:
+    """从候选选择器中提取正文，不再回退到整个 body。"""
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() == 0:
+                continue
+            html = (await locator.inner_html(timeout=5000)).strip()
+            if html:
+                return html
+        except Exception:
+            continue
+    raise ContentExtractionError(
+        f"未找到有效{content_kind}正文，页面结构可能已变化: {url}"
+    )
 
 
 async def _safe_text(page: Page, selector: str, default: str) -> str:
@@ -446,7 +657,7 @@ async def _extract_date(page: Page) -> str:
             return match.group(1)
     except Exception:
         pass
-    return dt_date.today().isoformat()
+    return "未知日期"
 
 
 async def extract_answer(page: Page, url: str) -> dict:
@@ -460,10 +671,7 @@ async def extract_answer(page: Page, url: str) -> dict:
     await page.wait_for_timeout(3000)
     await _dismiss_popup(page)
 
-    # 检查反爬
-    text = await page.locator("body").inner_text()
-    if "40362" in text or "请求存在异常" in text:
-        raise Exception(f"触发知乎反爬 (40362): {url}")
+    await _assert_page_usable(page, url)
 
     # 等待内容加载
     try:
@@ -488,14 +696,16 @@ async def extract_answer(page: Page, url: str) -> dict:
     date = await _extract_date(page)
 
     # 提取回答 HTML
-    html = ""
-    try:
-        html = await page.locator(".QuestionAnswer-content .RichText").first.inner_html()
-    except Exception:
-        try:
-            html = await page.locator(".RichText").first.inner_html()
-        except Exception:
-            html = await page.locator("body").inner_html()
+    html = await _first_nonempty_html(
+        page,
+        (
+            ".QuestionAnswer-content .RichText",
+            ".AnswerCard .RichText",
+            "[data-zop] .RichText",
+        ),
+        content_kind="回答",
+        url=url,
+    )
 
     return {
         "title": title.strip(),
@@ -518,9 +728,7 @@ async def extract_article(page: Page, url: str) -> dict:
     await page.wait_for_timeout(3000)
     await _dismiss_popup(page)
 
-    text = await page.locator("body").inner_text()
-    if "40362" in text or "请求存在异常" in text:
-        raise Exception(f"触发知乎反爬 (40362): {url}")
+    await _assert_page_usable(page, url)
 
     try:
         await page.wait_for_selector("h1.Post-Title", timeout=15000)
@@ -533,15 +741,16 @@ async def extract_article(page: Page, url: str) -> dict:
         author = await _safe_text(page, ".AuthorInfo-name .UserLink-link", "未知作者")
     date = await _extract_date(page)
 
-    html = ""
-    try:
-        rich = page.locator(".Post-RichTextContainer .RichText").first
-        if await rich.count() > 0:
-            html = await rich.inner_html()
-        else:
-            html = await page.locator(".RichText").first.inner_html()
-    except Exception:
-        html = await page.locator("body").inner_html()
+    html = await _first_nonempty_html(
+        page,
+        (
+            ".Post-RichTextContainer .RichText",
+            "article .RichText",
+            ".Post-content .RichText",
+        ),
+        content_kind="文章",
+        url=url,
+    )
 
     # 尝试获取头图
     try:
@@ -574,10 +783,7 @@ async def extract_pin(page: Page, url: str) -> dict:
     await page.wait_for_timeout(3000)
     await _dismiss_popup(page)
 
-    # 检查反爬
-    text = await page.locator("body").inner_text()
-    if "40362" in text or "请求存在异常" in text:
-        raise Exception(f"触发知乎反爬 (40362): {url}")
+    await _assert_page_usable(page, url)
 
     # 等待内容加载
     try:
@@ -593,29 +799,23 @@ async def extract_pin(page: Page, url: str) -> dict:
     date = await _extract_date(page)
 
     # 提取想法 HTML 内容
-    html = ""
-    for sel in [
+    pin_selectors = (
         ".PinItem .RichContent-inner",
         ".PinItem .RichContent",
+        ".PinItem .RichText",
         ".Pin-content .RichText",
-        ".RichText",
-    ]:
-        try:
-            loc = page.locator(sel).first
-            if await loc.count() > 0:
-                html = await loc.inner_html()
-                if html.strip():
-                    break
-        except Exception:
-            continue
-
-    if not html:
-        html = await page.locator("body").inner_html()
+    )
+    html = await _first_nonempty_html(
+        page,
+        pin_selectors,
+        content_kind="想法",
+        url=url,
+    )
 
     # 想法没有标题，用内容前 50 字作为标题
     plain_text = await page.locator("body").inner_text()
     # 从正文中提取前 50 字
-    for sel in [".PinItem .RichContent-inner", ".PinItem .RichContent", ".RichText"]:
+    for sel in pin_selectors:
         try:
             loc = page.locator(sel).first
             if await loc.count() > 0:
@@ -641,18 +841,42 @@ async def extract_pin(page: Page, url: str) -> dict:
 # ── 评论提取 ─────────────────────────────────────────────────
 
 async def _fetch_comment_page(page: Page, url: str) -> dict:
-    """通过浏览器 fetch 获取一页评论数据。"""
-    return await page.evaluate("""
-        async (url) => {
-            try {
-                const resp = await fetch(url, { credentials: 'include' });
-                if (!resp.ok) return { data: [], paging: { is_end: true } };
-                return await resp.json();
-            } catch (e) {
-                return { data: [], paging: { is_end: true } };
+    """通过浏览器 fetch 获取一页评论数据，失败时重试并明确报错。"""
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "www.zhihu.com"
+        or not parsed.path.startswith("/api/v4/comment_v5/")
+    ):
+        raise CommentFetchError(f"拒绝访问非预期评论 API: {url}")
+
+    last_error = "未知错误"
+    for attempt in range(1, 4):
+        result = await page.evaluate("""
+            async (url) => {
+                try {
+                    const resp = await fetch(url, { credentials: 'include' });
+                    if (!resp.ok) {
+                        return { ok: false, status: resp.status, error: `HTTP ${resp.status}` };
+                    }
+                    try {
+                        return { ok: true, status: resp.status, payload: await resp.json() };
+                    } catch (e) {
+                        return { ok: false, status: resp.status, error: `JSON: ${e.message}` };
+                    }
+                } catch (e) {
+                    return { ok: false, status: 0, error: e.message };
+                }
             }
-        }
-    """, url)
+        """, url)
+        if result.get("ok") and isinstance(result.get("payload"), dict):
+            return result["payload"]
+
+        last_error = result.get("error") or f"HTTP {result.get('status', 0)}"
+        if attempt < 3:
+            await asyncio.sleep((2 ** (attempt - 1)) + random.random())
+
+    raise CommentFetchError(f"评论 API 请求失败（已重试 3 次）: {last_error}，URL: {url}")
 
 
 def _get_comment_author(comment: dict) -> str:
@@ -687,6 +911,7 @@ async def extract_comments(page: Page, answer_id: str) -> list[dict]:
     print(f"   💬 正在获取评论...")
 
     all_comments = []
+    seen_root_pages: set[str] = set()
 
     # 首次请求：offset 留空，API 会返回第一页
     next_url = (
@@ -695,12 +920,20 @@ async def extract_comments(page: Page, answer_id: str) -> list[dict]:
     )
 
     while next_url:
+        if next_url in seen_root_pages:
+            raise CommentFetchError(f"评论分页游标重复，已停止以避免死循环: {next_url}")
+        seen_root_pages.add(next_url)
         data = await _fetch_comment_page(page, next_url)
 
-        if not data.get("data"):
-            break
+        page_comments = data.get("data")
+        if not isinstance(page_comments, list):
+            raise CommentFetchError(f"评论 API 返回格式异常: {next_url}")
+        if not page_comments:
+            if data.get("paging", {}).get("is_end", True):
+                break
+            raise CommentFetchError(f"评论分页尚未结束但返回空数据: {next_url}")
 
-        for comment in data["data"]:
+        for comment in page_comments:
             root = {
                 "author": _get_comment_author(comment),
                 "content": comment.get("content", ""),
@@ -710,20 +943,35 @@ async def extract_comments(page: Page, answer_id: str) -> list[dict]:
             }
 
             # 获取子评论（同样使用游标分页）
-            child_count = comment.get("child_comment_count", 0)
+            child_count = int(comment.get("child_comment_count", 0) or 0)
             if child_count > 0:
                 comment_id = comment.get("id", "")
+                if not comment_id:
+                    raise CommentFetchError("评论包含子评论计数，但缺少评论 ID")
                 child_next_url = (
                     f"https://www.zhihu.com/api/v4/comment_v5/comment/{comment_id}"
                     f"/child_comment?order_by=ts&limit=20&offset="
                 )
+                seen_child_pages: set[str] = set()
                 while child_next_url:
+                    if child_next_url in seen_child_pages:
+                        raise CommentFetchError(
+                            f"子评论分页游标重复，已停止以避免死循环: {child_next_url}"
+                        )
+                    seen_child_pages.add(child_next_url)
                     child_data = await _fetch_comment_page(page, child_next_url)
 
-                    if not child_data.get("data"):
-                        break
+                    child_comments = child_data.get("data")
+                    if not isinstance(child_comments, list):
+                        raise CommentFetchError(f"子评论 API 返回格式异常: {child_next_url}")
+                    if not child_comments:
+                        if child_data.get("paging", {}).get("is_end", True):
+                            break
+                        raise CommentFetchError(
+                            f"子评论分页尚未结束但返回空数据: {child_next_url}"
+                        )
 
-                    for child in child_data["data"]:
+                    for child in child_comments:
                         reply_to_author = child.get("reply_to_author")
                         reply_to_name = ""
                         if isinstance(reply_to_author, dict):
@@ -801,38 +1049,121 @@ def format_comments_markdown(comments: list[dict]) -> str:
 # ── 图片下载 ─────────────────────────────────────────────────
 
 async def download_images(img_urls: list[str], dest: Path) -> dict[str, str]:
-    """下载图片到本地，返回 URL → 本地路径 的映射。"""
+    """并发下载图片到本地，返回规范化 URL → 本地路径的映射。"""
     dest.mkdir(parents=True, exist_ok=True)
     url_to_local: dict[str, str] = {}
+    failures: list[tuple[str, str]] = []
+    semaphore = asyncio.Semaphore(MAX_IMAGE_CONCURRENCY)
 
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
     async with httpx.AsyncClient(
         headers=IMG_HEADERS,
         timeout=30.0,
-        follow_redirects=True,
+        follow_redirects=False,
         limits=limits,
     ) as client:
-        for img_url in img_urls:
+
+        async def download_one(raw_url: str) -> None:
+            img_url = normalize_image_url(raw_url)
+            if not img_url or "data:image" in img_url or "equation" in img_url:
+                return
+
+            parsed = urlparse(img_url)
+            hostname = (parsed.hostname or "").lower()
+            if parsed.scheme not in ALLOWED_IMAGE_SCHEMES or not hostname:
+                failures.append((img_url, "不支持的 URL"))
+                return
+            if hostname == "localhost" or hostname.endswith(".localhost"):
+                failures.append((img_url, "拒绝访问本机地址"))
+                return
             try:
-                if img_url.startswith("//"):
-                    img_url = "https:" + img_url
-
-                if "data:image" in img_url or "equation" in img_url:
-                    continue
-
-                resp = await client.get(img_url)
-                resp.raise_for_status()
-
-                ext = Path(urlparse(img_url).path).suffix or ".jpg"
-                if len(ext) > 5:
-                    ext = ".jpg"
-
-                fname = hashlib.md5(img_url.encode()).hexdigest()[:12] + ext
-                fpath = dest / fname
-                fpath.write_bytes(resp.content)
-                url_to_local[img_url] = f"images/{fname}"
-            except Exception:
+                ip = ipaddress.ip_address(hostname)
+                if not ip.is_global:
+                    failures.append((img_url, "拒绝访问私有或保留地址"))
+                    return
+            except ValueError:
                 pass
+
+            async with semaphore:
+                temp_path: Path | None = None
+                response: httpx.Response | None = None
+                try:
+                    current_url = img_url
+                    for _ in range(6):
+                        request = client.build_request("GET", current_url)
+                        response = await client.send(request, stream=True)
+                        if response.is_redirect:
+                            location = response.headers.get("location")
+                            if not location:
+                                raise httpx.HTTPError("重定向响应缺少 Location")
+                            await response.aclose()
+                            response = None
+                            current_url = normalize_image_url(urljoin(current_url, location))
+                            redirect_host = (urlparse(current_url).hostname or "").lower()
+                            if redirect_host in {"", "localhost"} or redirect_host.endswith(".localhost"):
+                                raise httpx.HTTPError("重定向到了不安全地址")
+                            try:
+                                redirect_ip = ipaddress.ip_address(redirect_host)
+                                if not redirect_ip.is_global:
+                                    raise httpx.HTTPError("重定向到了私有或保留地址")
+                            except ValueError:
+                                pass
+                            continue
+                        break
+                    else:
+                        raise httpx.TooManyRedirects("图片重定向次数超过 5 次")
+
+                    if response is None:
+                        raise httpx.HTTPError("未收到响应")
+                    response.raise_for_status()
+
+                    content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                    url_ext = Path(urlparse(current_url).path).suffix.lower()
+                    allowed_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".avif"}
+                    if not content_type.startswith("image/") and url_ext not in allowed_exts:
+                        raise ValueError(f"响应不是图片（Content-Type: {content_type or '未知'}）")
+
+                    content_length = response.headers.get("content-length")
+                    if content_length and int(content_length) > MAX_IMAGE_BYTES:
+                        raise ValueError("图片超过 25 MiB 限制")
+
+                    mime_exts = {
+                        "image/jpeg": ".jpg",
+                        "image/png": ".png",
+                        "image/gif": ".gif",
+                        "image/webp": ".webp",
+                        "image/bmp": ".bmp",
+                        "image/svg+xml": ".svg",
+                        "image/avif": ".avif",
+                    }
+                    ext = url_ext if url_ext in allowed_exts else mime_exts.get(content_type, ".jpg")
+                    fname = hashlib.sha256(img_url.encode("utf-8")).hexdigest()[:16] + ext
+                    fpath = dest / fname
+                    temp_path = fpath.with_name(f".{fpath.name}.{uuid.uuid4().hex}.tmp")
+
+                    total_bytes = 0
+                    with temp_path.open("wb") as handle:
+                        async for chunk in response.aiter_bytes():
+                            total_bytes += len(chunk)
+                            if total_bytes > MAX_IMAGE_BYTES:
+                                raise ValueError("图片超过 25 MiB 限制")
+                            handle.write(chunk)
+                    temp_path.replace(fpath)
+                    url_to_local[img_url] = f"images/{fname}"
+                except Exception as exc:
+                    failures.append((img_url, str(exc)))
+                finally:
+                    if response is not None:
+                        await response.aclose()
+                    if temp_path and temp_path.exists():
+                        temp_path.unlink()
+
+        await asyncio.gather(*(download_one(url) for url in img_urls))
+
+    for failed_url, reason in failures[:5]:
+        print(f"   ⚠️  图片下载失败: {failed_url}（{reason}）")
+    if len(failures) > 5:
+        print(f"   ⚠️  另有 {len(failures) - 5} 张图片下载失败")
 
     return url_to_local
 
@@ -847,9 +1178,9 @@ async def save_content_as_markdown(
     将提取到的内容保存为 Markdown 文件。
 
     当 download_img=True 时（默认模式）：
-        输出结构为  <type_dir>/<日期_标题_作者>/index.md，图片存于 images/ 子目录。
+        输出结构为  <type_dir>/<日期_标题_作者__类型_ID>/index.md，图片存于 images/ 子目录。
     当 download_img=False 时（--no-images 模式）：
-        输出结构为  <type_dir>/<日期_标题>.md，图片以 [图片] 占位符替代。
+        输出结构为  <type_dir>/<日期_标题__类型_ID>.md，图片以 [图片] 占位符替代。
 
     Args:
         info: extract_answer 或 extract_article 返回的字典
@@ -876,7 +1207,14 @@ async def save_content_as_markdown(
 
     if download_img:
         # 普通模式：每篇内容一个子文件夹，图片存于 images/ 子目录
-        folder_name = sanitize_filename(f"[{date}] {title} - {author}")
+        folder_name = _content_path_stem(
+            date=date,
+            title=title,
+            author=author,
+            url=url,
+            content_type=content_type,
+            include_author=True,
+        )
         folder = type_dir / folder_name
         folder.mkdir(parents=True, exist_ok=True)
 
@@ -893,9 +1231,16 @@ async def save_content_as_markdown(
         converter = ZhihuConverter(img_map=img_map)
         md_path = folder / "index.md"
     else:
-        # --no-images 模式：所有文件直接放在 <type_dir>/ 中，以日期+标题命名
+        # --no-images 模式：稳定 ID 防止同日同标题内容互相覆盖
         type_dir.mkdir(parents=True, exist_ok=True)
-        file_name = sanitize_filename(f"{date}_{title}") + ".md"
+        file_name = _content_path_stem(
+            date=date,
+            title=title,
+            author=author,
+            url=url,
+            content_type=content_type,
+            include_author=False,
+        ) + ".md"
         md_path = type_dir / file_name
 
         converter = ZhihuConverter(no_images=True)
@@ -918,21 +1263,24 @@ async def save_content_as_markdown(
     if comments:
         comments_md = format_comments_markdown(comments)
 
-    md_path.write_text(header + md + comments_md, encoding="utf-8")
+    _atomic_write_text(md_path, header + md + comments_md)
 
     return md_path
 
 
-def _scan_done_urls_from_disk(output_dir: Path) -> set[str]:
+def _scan_done_items_from_disk(
+    output_dir: Path,
+    subdirs: tuple[str, ...] = ("answers", "articles", "pins"),
+) -> dict[str, Path]:
     """
-    扫描输出目录中已存在的 Markdown 文件，从文件头部提取来源 URL。
+    扫描输出目录中已存在的 Markdown 文件，返回来源 URL → 文件路径。
     兼容两种结构：
       - 普通模式（有图片）：<type_dir>/<子文件夹>/index.md
-      - --no-images 模式：<type_dir>/<日期_标题>.md（直接在类型目录中）
+      - --no-images 模式：<type_dir>/<日期_标题__类型_ID>.md（直接在类型目录中）
     """
-    done = set()
+    done: dict[str, Path] = {}
     url_pattern = re.compile(r'>\s*\*\*来源\*\*:\s*\[([^\]]+)\]')
-    for subdir in ("answers", "articles", "pins"):
+    for subdir in subdirs:
         type_dir = output_dir / subdir
         if not type_dir.exists():
             continue
@@ -942,10 +1290,75 @@ def _scan_done_urls_from_disk(output_dir: Path) -> set[str]:
                 text = md_file.read_text(encoding="utf-8")[:500]
                 m = url_pattern.search(text)
                 if m:
-                    done.add(m.group(1))
+                    done[m.group(1)] = md_file
             except Exception:
                 pass
     return done
+
+
+def _scan_done_urls_from_disk(output_dir: Path) -> set[str]:
+    """兼容旧调用：返回磁盘上拥有有效 Markdown 文件的 URL 集合。"""
+    return set(_scan_done_items_from_disk(output_dir))
+
+
+def _read_recorded_progress_urls(progress_file: Path) -> set[str]:
+    """读取新旧两种进度格式，仅用于识别失效记录并给出提示。"""
+    if not progress_file.exists():
+        return set()
+    try:
+        payload = json.loads(progress_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+    urls: set[str] = set()
+    done = payload.get("done", [])
+    if isinstance(done, list):
+        urls.update(str(url) for url in done if isinstance(url, str))
+    items = payload.get("items", {})
+    if isinstance(items, dict):
+        urls.update(str(url) for url in items if isinstance(url, str))
+    return urls
+
+
+def _load_verified_progress(
+    output_dir: Path,
+    progress_file: Path,
+    subdirs: tuple[str, ...] = ("answers", "articles", "pins"),
+) -> dict[str, Path]:
+    """以磁盘文件为权威来源，丢弃指向已删除文件的幽灵进度。"""
+    recorded_urls = _read_recorded_progress_urls(progress_file)
+    disk_items = _scan_done_items_from_disk(output_dir, subdirs)
+    stale_urls = recorded_urls - set(disk_items)
+    if stale_urls:
+        print(f"⚠️  已移除 {len(stale_urls)} 条缺少对应文件的失效进度")
+    recovered_urls = set(disk_items) - recorded_urls
+    if recovered_urls:
+        print(f"📂 从磁盘恢复 {len(recovered_urls)} 条未写入进度文件的内容")
+    return disk_items
+
+
+def _write_progress(
+    progress_file: Path,
+    output_dir: Path,
+    done_items: dict[str, Path],
+) -> None:
+    """写入带文件映射的 v2 进度格式。"""
+    items: dict[str, str] = {}
+    for url, path in sorted(done_items.items()):
+        try:
+            relative = path.resolve().relative_to(output_dir.resolve()).as_posix()
+        except ValueError:
+            relative = str(path.resolve())
+        items[url] = relative
+    _atomic_write_json(
+        progress_file,
+        {
+            "version": 2,
+            "done": sorted(items),
+            "items": items,
+        },
+        indent=2,
+    )
 
 
 # ── 主爬取流程 ────────────────────────────────────────────────
@@ -956,8 +1369,8 @@ async def scrape_user(
     scrape_answers: bool = True,
     scrape_articles: bool = True,
     download_img: bool = True,
-    delay_min: float = 5.0,
-    delay_max: float = 10.0,
+    delay_min: float = 10.0,
+    delay_max: float = 20.0,
     headless: bool = False,
 ):
     """
@@ -974,9 +1387,12 @@ async def scrape_user(
         delay_max: 请求间最大延迟（秒）
         headless: 是否使用无头模式
     """
-    global MIN_DELAY, MAX_DELAY
-    MIN_DELAY = delay_min
-    MAX_DELAY = delay_max
+    _validate_delay_range(delay_min, delay_max)
+    if not scrape_answers and not scrape_articles:
+        raise ValueError("至少需要选择爬取回答或文章中的一种")
+    user_url_token = user_url_token.strip()
+    if not user_url_token:
+        raise ValueError("用户 URL Token 不能为空")
 
     if output_dir is None:
         output_dir = DEFAULT_OUTPUT_DIR / sanitize_filename(user_url_token)
@@ -1011,7 +1427,7 @@ async def scrape_user(
                 print("\n📝 正在收集文章列表...")
                 # 在收集文章之前添加延迟
                 if scrape_answers:
-                    delay = random_delay()
+                    delay = random_delay(delay_min, delay_max)
                     print(f"   ⏳ 等待 {delay:.1f} 秒...")
                     await asyncio.sleep(delay)
                 article_urls = await collect_user_articles(page, user_url_token)
@@ -1025,40 +1441,28 @@ async def scrape_user(
             total = len(all_urls)
             print(f"\n🚀 共计 {total} 项内容待爬取\n")
 
-            # ── 保存链接列表（用于断点续传） ──
+            # ── 保存本次发现的链接清单 ──
             links_file = output_dir / "links.json"
             links_data = [{"url": url, "type": t} for url, t in all_urls]
-            links_file.write_text(
-                json.dumps(links_data, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            _atomic_write_json(links_file, links_data, indent=2)
             print(f"📋 链接列表已保存到: {links_file}\n")
 
             # ── 检查已爬取的内容（断点续传） ──
             progress_file = output_dir / "progress.json"
-            done_urls = set()
-            if progress_file.exists():
-                try:
-                    done_data = json.loads(progress_file.read_text(encoding="utf-8"))
-                    done_urls = set(done_data.get("done", []))
-                except Exception:
-                    pass
-
-            # 扫描磁盘上已存在的文件，补充 progress.json 可能遗漏的记录
-            disk_urls = _scan_done_urls_from_disk(output_dir)
-            if disk_urls - done_urls:
-                print(f"📂 从磁盘扫描发现 {len(disk_urls - done_urls)} 个已下载但未记录的内容")
-                done_urls |= disk_urls
+            done_items = _load_verified_progress(
+                output_dir,
+                progress_file,
+                ("answers", "articles"),
+            )
+            done_urls = set(done_items)
 
             if done_urls:
                 # 只统计与当前链接列表匹配的数量
                 matched = sum(1 for url, _ in all_urls if url in done_urls)
                 print(f"📌 检测到之前的进度，已完成 {matched}/{total} 项，将跳过。\n")
 
-                # 同步更新 progress.json
-                progress_file.write_text(
-                    json.dumps({"done": list(done_urls)}, ensure_ascii=False),
-                    encoding="utf-8",
-                )
+            if progress_file.exists() or done_items:
+                _write_progress(progress_file, output_dir, done_items)
 
             # ── 逐个爬取 ──
             success_count = 0
@@ -1083,26 +1487,24 @@ async def scrape_user(
 
                     success_count += 1
                     done_urls.add(url)
+                    done_items[url] = md_path
 
                     # 更新进度
-                    progress_file.write_text(
-                        json.dumps({"done": list(done_urls)}, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
+                    _write_progress(progress_file, output_dir, done_items)
 
                 except Exception as e:
                     fail_count += 1
                     print(f"   ❌ 失败: {e}")
 
                     # 如果触发反爬，加大延迟
-                    if "40362" in str(e) or "反爬" in str(e):
+                    if isinstance(e, AntiBotError):
                         extra_wait = 30 + random.random() * 30
                         print(f"   ⚠️  触发反爬机制，额外等待 {extra_wait:.0f} 秒...")
                         await asyncio.sleep(extra_wait)
 
                 # 请求间延迟
                 if idx < total:
-                    delay = random_delay()
+                    delay = random_delay(delay_min, delay_max)
                     print(f"   ⏳ 等待 {delay:.1f} 秒...\n")
                     await asyncio.sleep(delay)
 
@@ -1139,9 +1541,9 @@ async def scrape_question(
         delay_max: 请求间最大延迟（秒）
         headless: 是否使用无头模式
     """
-    global MIN_DELAY, MAX_DELAY
-    MIN_DELAY = delay_min
-    MAX_DELAY = delay_max
+    _validate_delay_range(delay_min, delay_max)
+    if max_answers is not None and max_answers <= 0:
+        raise ValueError("最大回答数必须是正整数")
 
     question_id = parse_question_id(question_input)
 
@@ -1149,7 +1551,7 @@ async def scrape_question(
         output_dir = DEFAULT_OUTPUT_DIR / f"question_{question_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    limit_str = f"前 {max_answers} 个" if max_answers else "全部"
+    limit_str = f"前 {max_answers} 个" if max_answers is not None else "全部"
 
     print("=" * 60)
     print(f"📚 开始爬取问题: {question_id}")
@@ -1181,35 +1583,24 @@ async def scrape_question(
             # ── 保存链接列表 ──
             links_file = output_dir / "links.json"
             links_data = [{"url": url, "type": "answer"} for url in answer_urls]
-            links_file.write_text(
-                json.dumps(links_data, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            _atomic_write_json(links_file, links_data, indent=2)
             print(f"📋 链接列表已保存到: {links_file}\n")
 
             # ── 断点续传 ──
             progress_file = output_dir / "progress.json"
-            done_urls = set()
-            if progress_file.exists():
-                try:
-                    done_data = json.loads(progress_file.read_text(encoding="utf-8"))
-                    done_urls = set(done_data.get("done", []))
-                except Exception:
-                    pass
-
-            # 扫描磁盘上已存在的文件，补充 progress.json 可能遗漏的记录
-            disk_urls = _scan_done_urls_from_disk(output_dir)
-            if disk_urls - done_urls:
-                print(f"📂 从磁盘扫描发现 {len(disk_urls - done_urls)} 个已下载但未记录的内容")
-                done_urls |= disk_urls
+            done_items = _load_verified_progress(
+                output_dir,
+                progress_file,
+                ("answers",),
+            )
+            done_urls = set(done_items)
 
             if done_urls:
                 matched = sum(1 for u in answer_urls if u in done_urls)
                 print(f"📌 检测到之前的进度，已完成 {matched}/{total} 项，将跳过。\n")
 
-                progress_file.write_text(
-                    json.dumps({"done": list(done_urls)}, ensure_ascii=False),
-                    encoding="utf-8",
-                )
+            if progress_file.exists() or done_items:
+                _write_progress(progress_file, output_dir, done_items)
 
             # ── 逐个爬取 ──
             success_count = 0
@@ -1230,23 +1621,21 @@ async def scrape_question(
 
                     success_count += 1
                     done_urls.add(url)
+                    done_items[url] = md_path
 
-                    progress_file.write_text(
-                        json.dumps({"done": list(done_urls)}, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
+                    _write_progress(progress_file, output_dir, done_items)
 
                 except Exception as e:
                     fail_count += 1
                     print(f"   ❌ 失败: {e}")
 
-                    if "40362" in str(e) or "反爬" in str(e):
+                    if isinstance(e, AntiBotError):
                         extra_wait = 30 + random.random() * 30
                         print(f"   ⚠️  触发反爬机制，额外等待 {extra_wait:.0f} 秒...")
                         await asyncio.sleep(extra_wait)
 
                 if idx < total:
-                    delay = random_delay()
+                    delay = random_delay(delay_min, delay_max)
                     print(f"   ⏳ 等待 {delay:.1f} 秒...\n")
                     await asyncio.sleep(delay)
 
@@ -1283,9 +1672,7 @@ async def scrape_single_answer(
         delay_max: 请求间最大延迟（秒）
         headless: 是否使用无头模式
     """
-    global MIN_DELAY, MAX_DELAY
-    MIN_DELAY = delay_min
-    MAX_DELAY = delay_max
+    _validate_delay_range(delay_min, delay_max)
 
     answer_url, question_id, answer_id = parse_answer_url(answer_input)
 
@@ -1333,8 +1720,8 @@ async def scrape_user_pins(
     user_url_token: str,
     output_dir: Path | None = None,
     download_img: bool = True,
-    delay_min: float = 5.0,
-    delay_max: float = 10.0,
+    delay_min: float = 10.0,
+    delay_max: float = 20.0,
     headless: bool = False,
 ):
     """
@@ -1348,9 +1735,10 @@ async def scrape_user_pins(
         delay_max: 请求间最大延迟（秒）
         headless: 是否使用无头模式
     """
-    global MIN_DELAY, MAX_DELAY
-    MIN_DELAY = delay_min
-    MAX_DELAY = delay_max
+    _validate_delay_range(delay_min, delay_max)
+    user_url_token = user_url_token.strip()
+    if not user_url_token:
+        raise ValueError("用户 URL Token 不能为空")
 
     if output_dir is None:
         output_dir = DEFAULT_OUTPUT_DIR / sanitize_filename(user_url_token)
@@ -1386,36 +1774,25 @@ async def scrape_user_pins(
             # ── 保存链接列表 ──
             links_file = output_dir / "pin_links.json"
             links_data = [{"url": url, "type": "pin"} for url in pin_urls]
-            links_file.write_text(
-                json.dumps(links_data, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            _atomic_write_json(links_file, links_data, indent=2)
             print(f"📋 链接列表已保存到: {links_file}\n")
 
             # ── 断点续传 ──
             progress_file = output_dir / "pin_progress.json"
-            done_urls = set()
-            if progress_file.exists():
-                try:
-                    done_data = json.loads(progress_file.read_text(encoding="utf-8"))
-                    done_urls = set(done_data.get("done", []))
-                except Exception:
-                    pass
-
-            # 扫描磁盘上已存在的文件
-            disk_urls = _scan_done_urls_from_disk(output_dir)
-            if disk_urls - done_urls:
-                print(f"📂 从磁盘扫描发现 {len(disk_urls - done_urls)} 个已下载但未记录的内容")
-                done_urls |= disk_urls
+            done_items = _load_verified_progress(
+                output_dir,
+                progress_file,
+                ("pins",),
+            )
+            done_urls = set(done_items)
 
             if done_urls:
                 matched = sum(1 for url, _ in all_urls if url in done_urls)
                 if matched > 0:
                     print(f"📌 检测到之前的进度，已完成 {matched}/{total} 项，将跳过。\n")
 
-                    progress_file.write_text(
-                        json.dumps({"done": list(done_urls)}, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
+            if progress_file.exists() or done_items:
+                _write_progress(progress_file, output_dir, done_items)
 
             # ── 逐个爬取 ──
             success_count = 0
@@ -1437,24 +1814,22 @@ async def scrape_user_pins(
 
                     success_count += 1
                     done_urls.add(url)
+                    done_items[url] = md_path
 
-                    progress_file.write_text(
-                        json.dumps({"done": list(done_urls)}, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
+                    _write_progress(progress_file, output_dir, done_items)
 
                 except Exception as e:
                     fail_count += 1
                     print(f"   ❌ 失败: {e}")
 
-                    if "40362" in str(e) or "反爬" in str(e):
+                    if isinstance(e, AntiBotError):
                         extra_wait = 30 + random.random() * 30
                         print(f"   ⚠️  触发反爬机制，额外等待 {extra_wait:.0f} 秒...")
                         await asyncio.sleep(extra_wait)
 
                 # 请求间延迟
                 if idx < total:
-                    delay = random_delay()
+                    delay = random_delay(delay_min, delay_max)
                     print(f"   ⏳ 等待 {delay:.1f} 秒...\n")
                     await asyncio.sleep(delay)
 
