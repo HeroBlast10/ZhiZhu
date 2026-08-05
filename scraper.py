@@ -48,6 +48,9 @@ MAX_DELAY: float = 20.0
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_IMAGE_CONCURRENCY = 5
 ALLOWED_IMAGE_SCHEMES = {"http", "https"}
+MAX_FILENAME_COMPONENT_CHARS = 120
+# Linux 等文件系统通常以 UTF-8 字节数限制单个路径组件；预留少量余量。
+MAX_FILENAME_COMPONENT_BYTES = 240
 
 
 class ScraperError(RuntimeError):
@@ -111,12 +114,23 @@ print = _safe_print
 
 # ── 工具函数 ──────────────────────────────────────────────────
 
+def _truncate_filename_component(
+    value: str,
+    *,
+    max_chars: int = MAX_FILENAME_COMPONENT_CHARS,
+    max_bytes: int = MAX_FILENAME_COMPONENT_BYTES,
+) -> str:
+    """按字符数和 UTF-8 字节数截断单个路径组件。"""
+    value = value[:max_chars]
+    if len(value.encode("utf-8")) > max_bytes:
+        value = value.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+    return value.rstrip(" .")
+
 def sanitize_filename(name: str) -> str:
     """清理文件名中不允许的字符。"""
     name = re.sub(r'[/\\:*?"<>|\x00-\x1f]', "_", name)
     name = name.strip(" .")
-    if len(name) > 120:
-        name = name[:120].rstrip(" .")
+    name = _truncate_filename_component(name)
     name = name or "untitled"
 
     # Windows 保留设备名即使带扩展名也不可作为普通文件名。
@@ -173,15 +187,24 @@ def _content_path_stem(
     if include_author:
         display += f" - {author}"
     display = sanitize_filename(display)
-    budget = max(1, 120 - len(suffix))
-    display = display[:budget].rstrip(" ._") or "untitled"
+    char_budget = max(1, MAX_FILENAME_COMPONENT_CHARS - len(suffix))
+    byte_budget = max(
+        1,
+        MAX_FILENAME_COMPONENT_BYTES - len(suffix.encode("utf-8")),
+    )
+    display = _truncate_filename_component(
+        display,
+        max_chars=char_budget,
+        max_bytes=byte_budget,
+    ).rstrip("_") or "untitled"
     return f"{display}{suffix}"
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
     """在同目录先写临时文件，再原子替换目标文件。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    # 临时名不拼接目标名，避免长标题在 Linux 上超过单个路径组件的字节上限。
+    temp_path = path.with_name(f".tmp-{uuid.uuid4().hex}")
     try:
         temp_path.write_text(content, encoding="utf-8")
         temp_path.replace(path)

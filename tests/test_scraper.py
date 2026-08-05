@@ -71,7 +71,7 @@ class ScraperTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(first, second)
             self.assertEqual(len(list(root.rglob("*.md"))), 2)
 
-    async def test_long_titles_keep_stable_id_in_image_mode(self):
+    async def test_long_titles_keep_stable_id_with_cross_platform_limits(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             common = {
@@ -97,9 +97,24 @@ class ScraperTests(unittest.IsolatedAsyncioTestCase):
                 root,
                 True,
             )
-            self.assertNotEqual(first, second)
-            self.assertIn("answer_31", str(first))
-            self.assertIn("answer_32", str(second))
+            no_image = await save_content_as_markdown(
+                {
+                    **common,
+                    "url": "https://www.zhihu.com/question/2/answer/33",
+                },
+                root,
+                False,
+            )
+            self.assertEqual(len({first, second, no_image}), 3)
+            for identifier, path in (("31", first), ("32", second), ("33", no_image)):
+                self.assertIn(f"answer_{identifier}", str(path))
+                self.assertTrue(path.is_file())
+            for path in (first, second):
+                folder_name = path.parent.name
+                self.assertLessEqual(len(folder_name), 120)
+                self.assertLessEqual(len(folder_name.encode("utf-8")), 240)
+            self.assertLessEqual(len(no_image.name), 124)
+            self.assertLessEqual(len(no_image.name.encode("utf-8")), 244)
 
     async def test_missing_content_never_falls_back_to_body(self):
         with self.assertRaises(ContentExtractionError):
